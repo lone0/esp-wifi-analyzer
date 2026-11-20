@@ -1,0 +1,40 @@
+# 应用侧 sdkconfig(板级默认由 BMGR 板包 esp_mosaico 提供,见 README)
+# USB CDC 序列号留空 = 运行时从 eFuse MAC 派生(esp_tinyusb Kconfig 文档行为)
+CONFIG_TINYUSB_DESC_SERIAL_STRING=""
+
+# WiFi + LVGL exceeds IDF's 1500 KiB "large" single-app partition.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# esp_lvgl_adapter 官方推荐性能配置(mosaico-s31 验证值)
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_LV_DEF_REFR_PERIOD=15
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=2
+CONFIG_LV_USE_PERF_MONITOR_LOG_MODE=y
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_PRINTF=y
+
+# 性能档(landscape 验证配方;S31 无 S3 式 cache size 旋钮)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_320=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# WiFi 扫描(纯射频 RPC,无 netif)
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# 不开 BT,软共存(wifi/bt coex)是多余的——它的 init_coexist 是本镜像新增的
+# app_main 前启动初始化;首烧真机全黑无 USB,二分第一步先去掉它
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# usb_hs_console 需要 TinyUSB CDC 使能(mosaico-s31 同款)
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# Pascal 主任务栈:3584 默认值是 esp-units 记录的历史崩溃源(套件验证全部 ≥8192;
+# C 版 wifi_analyzer 用 32768)。FPC 启动+单元初始化+UIStart 深调用链需要余量。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# TLS 槽数=2:slot 0=pthread/lwIP(IDF 保留),slot 1=fthreads threadvar 块
+# (esp-units ad67f76 起 DataIndex=1)。缺这个 fthreads 写 slot1 越界穿 TCB。
+CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS=2

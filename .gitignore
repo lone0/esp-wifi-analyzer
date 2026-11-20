@@ -1,0 +1,19 @@
+# IDF build artifacts
+build/
+sdkconfig.old
+dependencies.lock
+managed_components/
+components/gen_bmgr_codes/
+
+# Hardware/debug helpers and captured logs
+tools/
+
+# Pascal build artifacts (esp-units conventions)
+*.o
+*.ppu
+*.elf
+*.bin
+*.img
+*.res
+link*.res
+ppas*.sh
