@@ -1,25 +1,32 @@
-{ chartsmodel - the yeager/wifi-analyzer app.py drawing logic (ChannelDrawingArea._draw
-  lines 978-1096, SignalHistoryDrawingArea._draw lines 1179-1207, fetched
-  2026-11-15) on chartdraw's primitives, parameterized by the data source.
+{ chartsmodel - the WiFi semantic layer: maps scan data onto the generic
+  chartplot renderer. Everything WiFi-specific lives here (channel axis,
+  dBm axis, SSID label text, palette assignment, width_mhz semantics);
+  everything generic lives in chartplot (axis maps, grid, fill+stroke
+  series, dashed reference line, label coordinates).
 
-  Differences from the esp-units examples/charts milestone copy:
-    - the fake dataset is gone; the callers feed real scan snapshots
-      (strongest-first sorted, as the C wifi_analyzer's ap_store_copy
-      produced) and the history ring of one AP;
-    - painter order is weakest -> strongest (the C port's deliberate
-      change over app.py's list order - strong curves overdraw weak);
-    - SSID labels are emitted for the strongest 8 (the palette size).
+  Transcription sources (yeager/wifi-analyzer app.py, fetched 2026-11-15):
+    - ChannelDrawingArea._draw (978-1096): margins 50/20/20/40, channels
+      1..13, dBm -100..-20, gridlines, bell curves (61 gaussian samples,
+      fill alpha 0.3, stroke alpha 0.9 width 2), SSID labels, focused-
+      channel dashed highlight (width 3, dash 5:3).
+    - SignalHistoryDrawingArea._draw (1179-1207): margins 42/18/18/30,
+      percent gridlines (cairo default width 2), signal polyline
+      rgb(0.25,0.65,1.0) width 2, x spread over point index.
 
-  Cairo-to-raster substitutions (all deliberate, milestone-verified
-  against the pycairo reference to <=1 LSB on fills/grid/dash):
-    - 0.5px AA gridlines -> 1px at ink-preserving alpha (GRID_A 38;
-      cairo 0.5px @0.3 has total ink 0.15, our pixel values then match);
-    - 61-point stroked polylines -> per-column sampling (strictly finer);
-    - show_text -> TChartLabel records in cairo baseline coordinates -
-      the device renders them as LVGL labels, no font is rasterized;
-    - float coords -> PlotRound (symmetric), integers everywhere.
+  Ink compensation: app.py draws 0.5 px gridlines at alpha 0.3 - the
+  equivalent 1 px raster line carries alpha 0.15 (GRID_A 38: total ink =
+  coverage x alpha is what must match, verified pixel-exact vs cairo).
+  The bell fill (0.3) and stroke (0.9) are true area/stroke styles and
+  keep their alpha values.
 
-  Target-neutral: no units, compiles for esp32s31 and the host. }
+  Sampling: the bell curves are sampled at 61 points exactly like app.py
+  (and cairo draws them as 61-point polylines) - chartplot interpolates
+  between samples, matching the reference geometry. Percentages for the
+  history view: (rssi + 100) * 100 / 55 clamped (C wifi_scanner formula).
+
+  Labels are emitted in cairo show_text semantics (BASELINE coordinates,
+  app.py exact placement formulas); the UI layer converts baseline ->
+  LVGL label top. Target-neutral like chartplot. }
 
 unit chartsmodel;
 
@@ -30,7 +37,8 @@ interface
 uses
   SysUtils,   { IntToStr for the label texts }
   Math,       { exp }
-  chartdraw;  { the five primitives }
+  chartdraw,  { the 5 pixel primitives }
+  chartplot;  { the generic chart renderer }
 
 const
   { app.py colors, float rgb * 255 (cairo 1.0 = 255) }
@@ -46,16 +54,17 @@ const
   FILL_A   = 76;   { 0.3 - bell fill (a true 0.3 area fill) }
   STROKE_A = 230;  { 0.9 - bell outline }
   HGRID_A  = 89;   { 0.35 - history grid (true 2px @0.35) }
-
   { the channel grid is cairo 0.5px @0.3 - total ink = coverage*alpha =
-    0.15. Our 1px line matches cairo's PIXEL VALUES at alpha 38. }
+    0.15; our 1px line matches cairo's pixel values at alpha 38 }
   GRID_A   = 38;
 
-  { ChannelDrawingArea margins, verbatim (relative to the canvas) }
+  { ChannelDrawingArea margins + axis ranges, verbatim }
   CH_ML = 50;
-  CH_MR = 40;
+  CH_MR = 20;
   CH_MT = 20;
-  CH_MB = 24;
+  CH_MB = 40;
+  CH_MIN = 1;
+  CH_MAX = 13;
   DBM_MIN = -100;
   DBM_MAX = -20;
 
@@ -63,7 +72,7 @@ const
   HI_ML = 42;
   HI_MR = 18;
   HI_MT = 18;
-  HI_MB = 24;
+  HI_MB = 30;
 
   { curves/labels caps (C wifi_analyzer: MAX_CURVES 24, palette 8) }
   MAX_CURVES = 24;
@@ -78,15 +87,9 @@ type
     dbm: integer;
   end;
 
-  { a text label emitted by the renderers, in app.py's cairo semantics:
-    x,y is the BASELINE origin of show_text; the UI layer converts
-    baseline -> LVGL label top }
-  TChartLabel = record
-    x, y: integer;
-    text: string;
-    rgb: LongWord;
-  end;
-  TChartLabels = array of TChartLabel;
+  { per-channel occupancy per-mille; fixed bounds avoid open-array High
+    surprises at the unit boundary }
+  TUtil13 = array[0..12] of integer;
 
 const
   { colors[i mod 8] from ChannelDrawingArea._draw line 1047 }
@@ -101,95 +104,121 @@ const
     $9999FF   { 0.6, 0.6, 1.0 }
   );
 
-{ app.py ch_to_x / dbm_to_y (lines 1002/1005) }
-function ChToX(plot_w: integer; ch: Double): Double;
-function DbmToY(plot_h: integer; dbm: Double): Double;
+{ channel-axis map: channels 1..13 across the plot width }
+function ChAxis(plot_w: integer): TAxisMap;
+{ dBm-axis map: DBM_MIN at the plot bottom, DBM_MAX at the top }
+function DbmAxis(plot_h: integer): TAxisMap;
 
 { ChannelDrawingArea._draw on the plot buffer; nets arrive STRONGEST-FIRST
   and are painted weakest-first (reverse iteration). focused: channel
-  number for the dashed highlight, 0 = none. Labels come back in cairo
-  baseline coordinates. }
+  number for the dashed highlight, 0 = none. util_pm: per-channel
+  occupancy per-mille 0..1000, -1 = no data (pure black column). Labels
+  come back in cairo baseline coordinates (app.py exact placement). }
 procedure DrawChannelView(const p: TPlot; const nets: array of TNet;
-  focused: integer; out labels: TChartLabels);
+  focused: integer; const util_pm: TUtil13;
+  out labels: TChartLabels);
 
-{ SignalHistoryDrawingArea._draw: one AP's RSSI history, newest last,
-  as signal percentages 0..100. }
-procedure DrawHistoryView(const p: TPlot; const pts: array of integer;
+{ Repaint only channel ch's util strip (band + grid + overlapping bells).
+  Much cheaper than DrawChannelView; used between util dwells. }
+procedure PatchChannelUtilColumn(const p: TPlot; ch: integer;
+  util_pm: integer; const nets: array of TNet);
+
+{ SignalHistoryDrawingArea._draw: one AP's history as signal percentages
+  (0..100, oldest first) - the polyline the reference draws. }
+procedure DrawHistoryView(const p: TPlot; const pts: array of Double;
   out labels: TChartLabels);
 
 implementation
 
-function ChToX(plot_w: integer; ch: Double): Double;
+{ C wifi_analyzer channel_view.c util_band_color via lv_color_hsv_to_rgb }
+function wa_util_band_rgb(permille: LongInt): LongWord; cdecl; external;
+
+function ChAxis(plot_w: integer): TAxisMap;
 begin
-  Result := CH_ML + (ch - 1) / 12 * plot_w;
+  Result.Pix0 := CH_ML;
+  Result.Pix1 := CH_ML + plot_w;
+  Result.Val0 := CH_MIN;
+  Result.Val1 := CH_MAX;
 end;
 
-function DbmToY(plot_h: integer; dbm: Double): Double;
+function DbmAxis(plot_h: integer): TAxisMap;
 begin
-  Result := CH_MT + plot_h - (dbm - DBM_MIN) / (DBM_MAX - DBM_MIN) * plot_h;
-end;
-
-procedure AddLabel(var labels: TChartLabels; x, y: integer;
-  const text: string; rgb: LongWord);
-var
-  n: integer;
-begin
-  n := Length(labels);
-  SetLength(labels, n + 1);
-  labels[n].x := x;
-  labels[n].y := y;
-  labels[n].text := text;
-  labels[n].rgb := rgb;
+  Result.Pix0 := CH_MT + plot_h;   { DBM_MIN at the bottom }
+  Result.Pix1 := CH_MT;            { DBM_MAX at the top }
+  Result.Val0 := DBM_MIN;
+  Result.Val1 := DBM_MAX;
 end;
 
 procedure DrawChannelView(const p: TPlot; const nets: array of TNet;
-  focused: integer; out labels: TChartLabels);
+  focused: integer; const util_pm: TUtil13;
+  out labels: TChartLabels);
 var
   plot_w, plot_h: integer;
-  dbm, ch: integer;
-  y, x: Double;
-  i: integer;
+  ax, ay: TAxisMap;
+  i, k: integer;
   color: LongWord;
-  bw, center, peak_y, base_y: Double;
-  x0, x1, chx, dist, amp: Double;
-  xi, ry, base_i: integer;
+  bw, center, amp: Double;
+  s: TSeries;
   label_s: string;
+  x0, x1: integer;
+  grid_h: array[0..8] of Double;    { -100..-20 step 10 }
+  grid_v: array[0..12] of Double;   { 1..13 }
+  gst: TGridStyle;
+  fst: TFillStyle;
+  sst: TStrokeStyle;
+  dst: TDashSpec;
 begin
   SetLength(labels, 0);
-  PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);
+  { black base (C grid canvas) so night-sky bands read as colored shadow }
+  PlotFillRect(p, 0, 0, p.W, p.H, 0, 255);
 
   plot_w := p.W - CH_ML - CH_MR;
   plot_h := p.H - CH_MT - CH_MB;
-  base_y := DbmToY(plot_h, DBM_MIN);
-  base_i := PlotRound(base_y);
+  ax := ChAxis(plot_w);
+  ay := DbmAxis(plot_h);
+
+  { occupancy bands under grid/curves — C util_band_color per permille.
+    util_pm[i]: 0..1000, -1 = no data (stays black). Clip to the plot
+    so ch1/ch13 do not paint into the dBm / right margins. }
+  for i := 0 to 12 do
+  begin
+    k := util_pm[i];
+    x0 := PlotRound(AxPix(ax, (i + 1) - 0.5));
+    x1 := PlotRound(AxPix(ax, (i + 1) + 0.5));
+    if x0 < CH_ML then
+      x0 := CH_ML;
+    if x1 > CH_ML + plot_w then
+      x1 := CH_ML + plot_w;
+    if (x1 >= x0) and (k >= 0) then
+      PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
+  end;
+
+  { horizontal dBm gridlines + labels }
+  for i := 0 to 8 do
+    grid_h[i] := DBM_MIN + i * 10;
+  gst.Color := GRID_HEX;
+  gst.Alpha := GRID_A;
+  gst.WidthPx := 1;
+  PlotGridH(p, grid_h, ay, CH_ML, CH_ML + plot_w, gst);
+  for i := 0 to 8 do
+    AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
+      IntToStr(DBM_MIN + i * 10), DIM_HEX);
+
+  { vertical channel gridlines + tick labels }
+  for i := 0 to 12 do
+    grid_v[i] := CH_MIN + i;
+  PlotGridV(p, grid_v, ax, CH_MT, CH_MT + plot_h, gst);
+  for i := 0 to 12 do
+    AddLabel(labels, PlotRound(AxPix(ax, grid_v[i])) - 5,
+      p.H - CH_MB + 15, IntToStr(CH_MIN + i), DIM_HEX);
 
   if Length(nets) = 0 then
   begin
-    { app.py line 987: empty state (hand-centered, as the reference does) }
     AddLabel(labels, p.W div 2 - 60, p.H div 2, 'No networks found', DIM_HEX);
     exit;
   end;
 
-  { horizontal dBm gridlines + labels, lines 990-1001 }
-  dbm := -100;
-  while dbm <= -20 do
-  begin
-    y := DbmToY(plot_h, dbm);
-    PlotFillRect(p, CH_ML, PlotRound(y), plot_w, 1, GRID_HEX, GRID_A);
-    AddLabel(labels, 5, PlotRound(y) + 4, IntToStr(dbm), DIM_HEX);
-    Inc(dbm, 10);
-  end;
-
-  { vertical channel gridlines + tick labels, lines 1002-1013 }
-  for ch := 1 to 13 do
-  begin
-    x := ChToX(plot_w, ch);
-    PlotFillRect(p, PlotRound(x), CH_MT, 1, plot_h, GRID_HEX, GRID_A);
-    AddLabel(labels, PlotRound(x) - 5, p.H - CH_MB + 15, IntToStr(ch), DIM_HEX);
-  end;
-
-  { bell curves, lines 1042-1086; weakest first = reverse of the
-    strongest-first array }
+  { bell curves, weakest first; 61 gaussian samples in value space }
   for i := High(nets) downto 0 do
   begin
     if i >= MAX_CURVES then
@@ -199,19 +228,20 @@ begin
     bw := nets[i].width_mhz / 10;
     if bw < 1 then
       bw := 1;
-    peak_y := DbmToY(plot_h, nets[i].dbm);
 
-    x0 := ChToX(plot_w, center - bw * 2);
-    x1 := ChToX(plot_w, center + bw * 2);
-    for xi := PlotRound(x0) to PlotRound(x1) do
+    SetLength(s, 61);
+    for k := 0 to 60 do
     begin
-      chx := 1 + (xi - CH_ML) / plot_w * 12;
-      dist := (chx - center) / bw;
-      amp := exp(-dist * dist * 2);
-      ry := PlotRound(base_y + (peak_y - base_y) * amp);
-      PlotFillRect(p, xi, ry, 1, base_i - ry + 1, color, FILL_A);
-      PlotStrokeColumn(p, xi, ry, color, STROKE_A);
+      s[k].X := center - bw * 2 + bw * 4 * k / 60;
+      amp := exp(-sqr((s[k].X - center) / bw) * 2);
+      s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
     end;
+    fst.Color := color;
+    fst.Alpha := FILL_A;
+    sst.Color := color;
+    sst.Alpha := STROKE_A;
+    sst.WidthPx := 2;
+    PlotSeriesFillBaseline(p, s, ax, ay, DBM_MIN, fst, sst);
   end;
 
   { SSID labels for the strongest PALETTE_SIZE, lines 1082-1086 }
@@ -223,30 +253,107 @@ begin
     if label_s = '' then
       label_s := '(hidden)';
     AddLabel(labels,
-      PlotRound(ChToX(plot_w, nets[i].channel))
-        - PlotRound(Length(label_s) * 2.5),
-      PlotRound(DbmToY(plot_h, nets[i].dbm)) - 6,
+      PlotRound(AxPix(ax, nets[i].channel)) - PlotRound(Length(label_s) * 2.5),
+      PlotRound(AxPix(ay, nets[i].dbm)) - 6,
       label_s, PALETTE[i mod PALETTE_SIZE]);
   end;
 
   { focused-channel dashed highlight, lines 1088-1096 }
-  if (focused >= 1) and (focused <= 13) then
+  if (focused >= CH_MIN) and (focused <= CH_MAX) then
   begin
-    x := ChToX(plot_w, focused);
-    if (x >= CH_ML) and (x <= p.W - CH_MR) then
-      PlotDashedVLine(p, PlotRound(x), CH_MT, p.H - CH_MB, 3,
-        FOCUS_HEX, 5, 3);
+    dst.Color := FOCUS_HEX;
+    dst.WidthPx := 3;
+    dst.OnLen := 5;
+    dst.OffLen := 3;
+    PlotRefLineV(p, focused, ax, CH_MT, p.H - CH_MB, dst);
   end;
 end;
 
-procedure DrawHistoryView(const p: TPlot; const pts: array of integer;
+procedure PatchChannelUtilColumn(const p: TPlot; ch: integer;
+  util_pm: integer; const nets: array of TNet);
+var
+  plot_w, plot_h: integer;
+  ax, ay: TAxisMap;
+  i, k, x0, x1, gy: integer;
+  color: LongWord;
+  bw, center, amp: Double;
+  s: TSeries;
+  gst: TGridStyle;
+  fst: TFillStyle;
+  sst: TStrokeStyle;
+begin
+  if (ch < CH_MIN) or (ch > CH_MAX) then
+    exit;
+
+  plot_w := p.W - CH_ML - CH_MR;
+  plot_h := p.H - CH_MT - CH_MB;
+  ax := ChAxis(plot_w);
+  ay := DbmAxis(plot_h);
+  x0 := PlotRound(AxPix(ax, ch - 0.5));
+  x1 := PlotRound(AxPix(ax, ch + 0.5));
+  { ch1 extends left of CH_ML (dBm gutter); ch13 past the right edge —
+    keep util paint inside the plot so the strength column stays stable. }
+  if x0 < CH_ML then
+    x0 := CH_ML;
+  if x1 > CH_ML + plot_w then
+    x1 := CH_ML + plot_w;
+  if x1 < x0 then
+    exit;
+
+  { util band (or black if no data) }
+  if util_pm >= 0 then
+    PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(util_pm), 255)
+  else
+    PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, 0, 255);
+
+  { horizontal grid segments across this strip }
+  gst.Color := GRID_HEX;
+  gst.Alpha := GRID_A;
+  gst.WidthPx := 1;
+  for i := 0 to 8 do
+  begin
+    gy := PlotRound(AxPix(ay, DBM_MIN + i * 10));
+    PlotFillRect(p, x0, gy, x1 - x0 + 1, 1, gst.Color, gst.Alpha);
+  end;
+  { vertical channel line }
+  PlotFillRect(p, PlotRound(AxPix(ax, ch)), CH_MT, 1, plot_h, gst.Color, gst.Alpha);
+
+  { restore bell pixels that fall in this strip }
+  for i := High(nets) downto 0 do
+  begin
+    if i >= MAX_CURVES then
+      continue;
+    color := PALETTE[i mod PALETTE_SIZE];
+    center := nets[i].channel;
+    bw := nets[i].width_mhz / 10;
+    if bw < 1 then
+      bw := 1;
+    SetLength(s, 61);
+    for k := 0 to 60 do
+    begin
+      s[k].X := center - bw * 2 + bw * 4 * k / 60;
+      amp := exp(-sqr((s[k].X - center) / bw) * 2);
+      s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
+    end;
+    fst.Color := color;
+    fst.Alpha := FILL_A;
+    sst.Color := color;
+    sst.Alpha := STROKE_A;
+    sst.WidthPx := 2;
+    PlotSeriesFillBaselineClip(p, s, ax, ay, DBM_MIN, fst, sst, x0, x1);
+  end;
+end;
+
+procedure DrawHistoryView(const p: TPlot; const pts: array of Double;
   out labels: TChartLabels);
 var
   plot_w, plot_h: integer;
-  signal: integer;
-  y: Double;
-  i, n, ry: integer;
-  px, py, cx, cy: integer;
+  ax, ay: TAxisMap;
+  i, n: integer;
+  s: TSeries;
+  hst: TStrokeStyle;
+  gst: TGridStyle;
+  grid_v: array[0..4] of Double;
 begin
   SetLength(labels, 0);
   PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);   { paint, line 1181 }
@@ -255,35 +362,49 @@ begin
   plot_h := p.H - HI_MT - HI_MB;
   n := Length(pts);
 
-  { gridlines + "N%" labels, lines 1189-1197; cairo DEFAULT width 2 }
-  signal := 0;
-  while signal <= 100 do
-  begin
-    y := HI_MT + plot_h - signal / 100 * plot_h;
-    ry := PlotRound(y);
-    PlotFillRect(p, HI_ML, ry - 1, plot_w, 2, HGRID_HEX, HGRID_A);
-    AddLabel(labels, 4, ry + 4, IntToStr(signal) + '%', DIM_H_HEX);
-    Inc(signal, 25);
-  end;
+  { percent Y axis: 0% at the plot bottom, 100% at the top. Must be set
+    BEFORE PlotGridH - previously ay was still uninitialized here, so the
+    history gridlines landed at garbage Y while the labels (which used the
+    closed-form pixel formula) looked fine. }
+  ay.Pix0 := HI_MT + plot_h;
+  ay.Pix1 := HI_MT;
+  ay.Val0 := 0;
+  ay.Val1 := 100;
 
-  if n = 0 then
+  { percent gridlines + "N%" labels, lines 1189-1197; cairo's DEFAULT
+    width 2 (that method never calls set_line_width) at alpha 0.35 }
+  gst.Color := HGRID_HEX;
+  gst.Alpha := HGRID_A;
+  gst.WidthPx := 2;
+  for i := 0 to 4 do
+    grid_v[i] := i * 25;
+  PlotGridH(p, grid_v, ay, HI_ML, HI_ML + plot_w, gst);
+  for i := 0 to 4 do
+    AddLabel(labels, 4, PlotRound(AxPix(ay, grid_v[i])) + 4,
+      IntToStr(i * 25) + '%', DIM_H_HEX);
+
+  if n < 2 then
   begin
     AddLabel(labels, 20, p.H div 2, 'No local signal history yet', DIM_H_HEX);
     exit;
   end;
 
-  { the signal polyline, lines 1198-1206; x spread over the point index }
-  px := HI_ML;
-  cx := px;
-  cy := HI_MT + plot_h - pts[0] * plot_h div 100;
-  for i := 1 to n - 1 do
+  { the signal polyline, lines 1198-1206; x spread over the point index
+    (line 1191) }
+  SetLength(s, n);
+  ax.Pix0 := HI_ML;
+  ax.Pix1 := HI_ML + plot_w;
+  ax.Val0 := 0;
+  ax.Val1 := n - 1;
+  for i := 0 to n - 1 do
   begin
-    px := HI_ML + i * plot_w div (n - 1);
-    ry := HI_MT + plot_h - pts[i] * plot_h div 100;
-    PlotLine2(p, cx, cy, px, ry, HIST_HEX);
-    cx := px;
-    cy := ry;
+    s[i].X := i;
+    s[i].Y := pts[i];
   end;
+  hst.Color := HIST_HEX;
+  hst.Alpha := 255;
+  hst.WidthPx := 2;
+  PlotSeriesLine(p, s, ax, ay, hst);
 end;
 
 end.

@@ -1,19 +1,12 @@
-{ appui - the LVGL chrome (project requirement 6): top status bar +
-  view-toggle buttons + the raster chart canvas below it, with a
-  revision-gated 250 ms tick that repaints only when the scanner has
-  fed new data (requirement 9: no paint here exceeds a few ms; the
-  canvas blit runs asynchronously in the adapter task. If a
-  future view's paint ever approaches the budget, split it into
-  horizontal bands across successive tick calls - the paint dispatch
-  is per-view already, the banding is a local change inside one view).
+{ appui - LVGL chrome: status bar, view toggles, raster chart canvas.
+  50 ms tick: full redraw on UtilNeedFullPaint / revision change; during
+  a util sweep, patch one channel column per dwell. Never paint while
+  WalkActive (promiscuous RX) - PSRAM paint overlapping RX hangs MSPI.
 
-  Rounded corners (requirement 7): the Mosaico AMOLED cuts its four
-  corners. The status bar is dark-on-dark so its corner bleed is
-  invisible; the chart's own plot margins keep its axes and labels away
-  from the rounded corners.
+  Rounded corners (requirement 7): status bar is dark-on-dark; chart
+  margins keep axes/labels off the AMOLED cutouts.
 
-  Views: a registry of (name, repaint) entries - 2 today (channel /
-  history), more later; the buttons and switching loop over it. }
+  Views: CH (channel util + AP curves) and HIST (strongest RSSI%). }
 
 unit appui;
 
@@ -26,7 +19,7 @@ uses
   c_lvgl,           { LVGL 9.6 working subset (esp-units submodule) }
   boardlvgl,
   SysUtils,         { IntToStr }
-  chartdraw, chartsmodel, apstore, scanner;
+  chartdraw, chartplot, chartsmodel, apstore, scanner;
 
 const
   SCREEN_W = 480;
@@ -76,7 +69,7 @@ implementation
 
 type
   TlvTimerCb = procedure(timer: pointer); cdecl;
-  TIntegerArray = array of integer;
+  TDoubleArray = array of Double;
 
 { app-side LVGL growth (the submodule is frozen; these land back in
   esp-units' c_lvgl when it next evolves) }
@@ -98,7 +91,9 @@ var
   view_btns: array[0..VIEW_COUNT - 1] of plv_obj_t;
   label_pool: array[0..N_LABELS - 1] of plv_obj_t;
   active_view: integer = 0;
+  repaint_pending: byte = 0;   { a view switch awaits a walk-free tick }
   drawn_revision: longword = 0;
+  drawn_util_rev: longword = 0;
   snap: TAPEntries;
   nets: array of TNet;
 
@@ -150,7 +145,7 @@ end;
 
 { the strongest AP's ring as signal percentages, oldest -> newest
   (C app's rssi_to_pct: -100 dBm -> 0%, -45 dBm -> 100%) }
-function PctsOfStrongest: TIntegerArray;
+function PctsOfStrongest: TDoubleArray;
 var
   i, n, pct: integer;
 begin
@@ -176,10 +171,14 @@ end;
 procedure RepaintActive;
 var
   labels: TChartLabels;
-  pts: TIntegerArray;
+  pts: TDoubleArray;
+  util: TUtil13;
+  ch: integer;
 begin
+  for ch := 0 to 12 do
+    util[ch] := scanner.ChannelUtilPM(ch + 1);
   case active_view of
-    0: DrawChannelView(Plot, nets, 0, labels);
+    0: DrawChannelView(Plot, nets, 0, util, labels);
     1:
     begin
       pts := PctsOfStrongest;
@@ -192,13 +191,15 @@ end;
 
 procedure TickCb(timer: pointer); cdecl;
 var
-  rev, count: longword;
+  rev, util_rev, count: longword;
   status_buf: string;
+  need_paint: boolean;
 begin
   if canvas_buf = nil then
     exit;
 
   rev := APStoreRevision;
+  util_rev := scanner.UtilRevision;
   count := APStoreCount;
 
   status_buf := 'AP: ' + IntToStr(count);
@@ -210,11 +211,51 @@ begin
     lv_obj_set_style_bg_color(dot, ColorMake((SCAN_OFF shr 16) and $FF,
       (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
 
-  { revision-gated repaint: the scan cadence is ~2 s, so the full
-    canvas paint runs at ~0.5 Hz, not at the 4 Hz tick }
-  if rev <> drawn_revision then
+  if scanner.WalkActive <> 0 then
+  begin
+    repaint_pending := 1;
+    exit;
+  end;
+
+  { Forced full redraw (after scan / after util sweep). Clear the flag
+    only after paint so the scanner handshake WaitUiPainted can proceed. }
+  if scanner.UtilNeedFullPaint <> 0 then
   begin
     drawn_revision := rev;
+    drawn_util_rev := util_rev;
+    repaint_pending := 0;
+    RefreshSnapshot;
+    RepaintActive;
+    scanner.UtilNeedFullPaint := 0;
+    exit;
+  end;
+
+  { Between dwells: patch only the channel strip that just finished. }
+  if (scanner.UtilDeferPaint <> 0) and (scanner.UtilPatchCh <> 0) and
+    (active_view = 0) then
+  begin
+    if Length(nets) = 0 then
+      RefreshSnapshot;
+    PatchChannelUtilColumn(Plot, scanner.UtilPatchCh,
+      scanner.ChannelUtilPM(scanner.UtilPatchCh), nets);
+    scanner.UtilPatchCh := 0;
+    drawn_util_rev := util_rev;
+    lv_obj_invalidate(canvas_obj);
+    exit;
+  end;
+
+  need_paint := (rev <> drawn_revision) or (util_rev <> drawn_util_rev) or
+    (repaint_pending <> 0);
+  if need_paint and (scanner.UtilDeferPaint <> 0) then
+  begin
+    repaint_pending := 1;
+    exit;
+  end;
+  if need_paint then
+  begin
+    drawn_revision := rev;
+    drawn_util_rev := util_rev;
+    repaint_pending := 0;
     RefreshSnapshot;
     RepaintActive;
   end;
@@ -230,7 +271,11 @@ begin
   if (v >= 0) and (v < VIEW_COUNT) and (v <> active_view) then
   begin
     SwitchView(v);
-    RepaintActive;
+    { never repaint from the event callback directly: a PSRAM paint
+      burst overlapping the promiscuous walk hard-hangs the MSPI
+      arbiter - mark it pending; the tick repaints in a walk-free
+      window (<= ~1.5 s) }
+    repaint_pending := 1;
   end;
 end;
 
@@ -348,7 +393,7 @@ begin
   SwitchView(0);
   RefreshSnapshot;
   RepaintActive;
-  lv_timer_create(@TickCb, 250, nil);
+  lv_timer_create(@TickCb, 50, nil);
   if not wa_touch_indicator_start(TBoardLvgl.Touch) then
     writeln('WA: W touch indicator unavailable');
 end;

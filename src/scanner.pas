@@ -1,19 +1,16 @@
-{ scanner - continuous all-channel WiFi scanner, the Pascal twin of the C
-  wifi_analyzer's main/wifi_scanner.c: pure radio RPC (no netif), STA-only,
-  storage RAM, country CN to expose channels 12/13, blocking scan every
-  ~600 ms of gap, one RSSI sample per AP per cycle into apstore.
+{ scanner - WiFi probe engine, alternating two phases per cycle (C twin
+  of /mnt/storage/wifi_analyzer main/wifi_scanner.c):
 
-  Threading: the WiFi chain is brought up in the MAIN task (ScannerInit),
-  and the scan loop runs in an FTHREADS-managed worker (ScannerPrepare ->
-  fBeginThreadNamed 16 KB, gated by ScannerStart) so the FPC threadvar
-  block lives in FreeRTOS TLS slot 1 (esp-units ad67f76: fthreads moved
-  off slot 0, which IDF reserves for pthread/lwIP). The worker starts
-  scanning only after ScannerStart - the first scan lands after the UI
-  is up (requirement 9: no contention during display bring-up).
+    PHASE SCAN: esp_wifi_scan_start (AP list for curves/labels).
+    PHASE UTIL: per-channel promiscuous dwell in wifi_cfg_shim.c
+      (100 ms/ch, airtime -> per-mille store with TTL). LVGL adapter is
+      paused for each dwell so PSRAM paint cannot overlap RX on the
+      Mosaico MSPI path.
 
-  Scheduling (requirement 8): unpinned - the scheduler places it; revisit
-  after profiling. Worker stack 16 KB: scan record handling needs more
-  than fthreads' default. }
+  UI handshake: UtilNeedFullPaint + WaitUiPainted so AP curves are drawn
+  before util column patches; between dwells the tick patches one strip.
+  WalkActive: UI skips canvas work while a dwell runs.
+  ChannelUtilPM reads the C store (-1 = expired/never probed). }
 
 unit scanner;
 
@@ -21,28 +18,40 @@ unit scanner;
 
 interface
 
-{ 1 while a blocking scan is in flight - the UI scan dot reads it
-  (single-byte flag, benign race, same posture as the C app's
-  volatile bool s_scanning) }
 var
   ScannerBusy: byte = 0;
+  { 1 while a channel dwell runs (sniff on / LVGL paused) }
+  WalkActive: byte = 0;
+  { 1 between dwells / during sweep: prefer column patch over full redraw }
+  UtilDeferPaint: byte = 0;
+  { channel just measured (1..13); UI patches that column then clears to 0 }
+  UtilPatchCh: integer = 0;
+  { 1: UI must full-repaint (AP curves) at next walk-free tick }
+  UtilNeedFullPaint: byte = 0;
 
 function ScannerInit: boolean;
 procedure ScannerPrepare;
 procedure ScannerStart;
 
+{ per-channel occupancy, per-mille 0..1000; -1 = expired/never probed }
+function ChannelUtilPM(ch: integer): integer;
+function UtilRevision: longword;
+
 implementation
 
 uses
-  esp_task,    { vTaskDelay, pdMS_TO_TICKS, vTaskDelete }
-  fthreads,    { BeginThread manager + fBeginThreadNamed (TLS slot 1) }
+  esp_task,    { vTaskDelay, pdMS_TO_TICKS }
+  fthreads,    { fBeginThreadNamed (TLS slot 1) }
   c_bmgr,      { esp_err_t }
   c_wifi, apstore;
 
 const
   TAGmsg = 'WIFI-SCAN';
   SCAN_GAP_MS = 600;
-  RECORDS_PER_CHUNK = 32;   { one esp_wifi_scan_get_ap_records chunk }
+  { After each dwell: sniff off, LVGL window for touch + column patch.
+    Full redraw is handshaked after scan and again after the sweep. }
+  UTIL_TOUCH_YIELD_MS = 60;
+  RECORDS_PER_CHUNK = 32;
   WORKER_STACK = 16 * 1024;
 
 type
@@ -50,10 +59,39 @@ type
 
 var
   scan_cfg: TWifiScanCfgBytes;
-  worker_started: byte = 0;
   run_enabled: byte = 0;
 
-function ScanTaskFT(arg: pointer): ptrint;
+procedure wa_util_init; cdecl; external;
+procedure wa_util_sweep_begin; cdecl; external;
+procedure wa_util_dwell_channel(ch: cint); cdecl; external;
+procedure wa_util_sweep_end; cdecl; external;
+function wa_util_channel_pm(ch: cint): cint; cdecl; external;
+function wa_util_revision: longword; cdecl; external;
+
+function ChannelUtilPM(ch: integer): integer;
+begin
+  Result := wa_util_channel_pm(ch);
+end;
+
+function UtilRevision: longword;
+begin
+  Result := wa_util_revision;
+end;
+
+{ Spin until UI clears UtilNeedFullPaint (or timeout_ms). }
+procedure WaitUiPainted(timeout_ms: integer);
+var
+  waited: integer;
+begin
+  waited := 0;
+  while (UtilNeedFullPaint <> 0) and (waited < timeout_ms) do
+  begin
+    vTaskDelay(pdMS_TO_TICKS(20));
+    Inc(waited, 20);
+  end;
+end;
+
+procedure ScanAPs;
 var
   err: esp_err_t;
   num: word;
@@ -61,11 +99,47 @@ var
   i: integer;
   bssid: TBssid;
   now_ms: longword;
+begin
+  GetMem(recs, SizeOf(TRecordArray));
+  try
+    num := 0;
+    err := esp_wifi_scan_start(@scan_cfg, 1);
+    if err <> ESP_OK then
+    begin
+      writeln(TAGmsg, ': W scan_start failed: ', err);
+      exit;
+    end;
+    num := 0;
+    esp_wifi_scan_get_ap_num(@num);
+    if num = 0 then
+    begin
+      esp_wifi_clear_ap_list;
+      writeln(TAGmsg, ': I scan: 0 APs');
+      exit;
+    end;
+    if num > RECORDS_PER_CHUNK then
+      num := RECORDS_PER_CHUNK;
+    esp_wifi_scan_get_ap_records(@num, PApRecordBytes(recs));
+    now_ms := longword(esp_timer_get_time div 1000);
+    for i := 0 to num - 1 do
+    begin
+      RecBssid(PApRecordBytes(recs) + i, bssid);
+      APStoreAdd(bssid, RecSsid(PApRecordBytes(recs) + i),
+        RecPrimary(PApRecordBytes(recs) + i),
+        RecRssi(PApRecordBytes(recs) + i), now_ms);
+    end;
+    writeln(TAGmsg, ': I scan: ', num, ' APs (store ', APStoreCount, ')');
+  finally
+    FreeMem(recs);
+  end;
+end;
+
+function ScanTaskFT(arg: pointer): ptrint;
+var
   cycle: integer = 0;
+  ch: integer;
 begin
   Result := 0;
-  recs := nil;
-  GetMem(recs, SizeOf(TRecordArray));
   writeln(TAGmsg, ': I worker up (16 KB, fthreads/TLS slot 1)');
 
   repeat
@@ -75,38 +149,39 @@ begin
       continue;
     end;
     ScannerBusy := 1;
-    num := 0;
-    err := esp_wifi_scan_start(@scan_cfg, 1);  { block until done }
-    ScannerBusy := 0;
-    if err = ESP_OK then
+
+    ScanAPs;
+
+    { Wait until the UI tick has drawn AP curves before util patches. }
+    UtilNeedFullPaint := 1;
+    WaitUiPainted(800);
+    if UtilNeedFullPaint <> 0 then
+      writeln(TAGmsg, ': W UI paint ack timeout after scan');
+
+    { Per channel: dwell → UI patches that strip → next. }
+    UtilDeferPaint := 1;
+    wa_util_sweep_begin;
+    for ch := 1 to 13 do
     begin
-      num := 0;
-      esp_wifi_scan_get_ap_num(@num);
-      if num > 0 then
-      begin
-        if num > RECORDS_PER_CHUNK then
-          num := RECORDS_PER_CHUNK;
-        esp_wifi_scan_get_ap_records(@num, PApRecordBytes(recs));
-        now_ms := longword(esp_timer_get_time div 1000);
-        for i := 0 to num - 1 do
-        begin
-          RecBssid(PApRecordBytes(recs) + i, bssid);
-          APStoreAdd(bssid, RecSsid(PApRecordBytes(recs) + i),
-            RecPrimary(PApRecordBytes(recs) + i),
-            RecRssi(PApRecordBytes(recs) + i), now_ms);
-        end;
-      end;
-      writeln(TAGmsg, ': I scan cycle ', cycle, ': ', num, ' APs');
-    end
-    else
-      writeln(TAGmsg, ': W scan_start failed: ', err);
+      WalkActive := 1;
+      wa_util_dwell_channel(ch);
+      WalkActive := 0;
+      UtilPatchCh := ch;   { tick patches this strip, then clears }
+      vTaskDelay(pdMS_TO_TICKS(UTIL_TOUCH_YIELD_MS));
+    end;
+    UtilPatchCh := 0;
+    wa_util_sweep_end;
+    UtilDeferPaint := 0;
+    UtilNeedFullPaint := 1;  { reconcile util + AP curves after the sweep }
+    WaitUiPainted(800);
+    writeln(TAGmsg, ': I util sweep done');
+
+    ScannerBusy := 0;
     Inc(cycle);
     vTaskDelay(pdMS_TO_TICKS(SCAN_GAP_MS));
   until false;
 end;
 
-{ nvs + esp_wifi init/config/start - blocking, runs in the MAIN task
-  before the display chain (the C wifi_scanner.c order, minus the task) }
 function ScannerInit: boolean;
 var
   err: esp_err_t;
@@ -123,6 +198,15 @@ begin
     exit(false);
   end;
 
+  { channel-switch / sniffer post WiFi events; without a default loop
+    the driver logs ESP_ERR_INVALID_STATE (259) on every dwell. }
+  err := esp_event_loop_create_default;
+  if (err <> ESP_OK) and (err <> ESP_ERR_INVALID_STATE) then
+  begin
+    writeln(TAGmsg, ': E esp_event_loop_create_default: ', err);
+    exit(false);
+  end;
+
   err := esp_wifi_init(wifi_default_init_config);
   if err <> ESP_OK then
   begin
@@ -131,27 +215,24 @@ begin
   end;
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   esp_wifi_set_mode(WIFI_MODE_STA);
-  esp_wifi_set_country_code('CN', 1);   { expose channels 12/13 }
+  esp_wifi_set_country_code('CN', 1);
   err := esp_wifi_start;
   if err <> ESP_OK then
   begin
     writeln(TAGmsg, ': E esp_wifi_start failed: ', err);
     exit(false);
   end;
-  writeln(TAGmsg, ': I scanner ready (all 2.4G channels, country CN)');
+
+  wa_util_init;
   ScanCfgDefault(scan_cfg);
+  writeln(TAGmsg, ': I scanner ready (all 2.4G channels, country CN)');
   Result := true;
 end;
 
-{ spawn the scan worker (16 KB, fthreads/TLS slot 1); the worker waits
-  for ScannerStart before its first scan. fBeginThreadNamed performs the
-  once-only manager/TLS initialization itself; this standard path arms the
-  foreign-task relocation hook before LVGL creates its C worker. }
 procedure ScannerPrepare;
 var
   id: TThreadID;
 begin
-  worker_started := 1;
   fBeginThreadNamed(WORKER_STACK, @ScanTaskFT, nil, id, 'wifi_scan');
   writeln(TAGmsg, ': I worker spawned (16 KB, fthreads/TLS slot 1)');
 end;

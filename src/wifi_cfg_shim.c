@@ -17,13 +17,24 @@
  *    into the closure, replace this with the toolchain libstdc++ link.
  *
  * 3) A non-clickable LVGL touch indicator follows the registered input
- *    device and remains visible briefly after release. */
+ *    device and remains visible briefly after release.
+ *
+ * 4) Channel utilization meter: promiscuous dwell per 2.4 GHz channel,
+ *    airtime accumulation, per-mille store with TTL, and
+ *    wa_util_band_rgb (C util_band_color / HSV). LVGL adapter is paused
+ *    for each dwell so paint cannot overlap RX on Mosaico MSPI. */
 #include <stdlib.h>
+#include <string.h>
 #include "esp_wifi.h"
+#include "esp_wifi_he_types.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_lv_adapter.h"
 #include "lvgl.h"
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static void wa_console_flush_task(void *arg)
 {
@@ -148,4 +159,263 @@ void wa_motor_buzz(int n)
         *w1tc = (1u << 8);
         for (i = 0; i < 24000000; i++) { }  /* ~280 ms gap */
     }
+}
+
+/* =====================================================================
+ * Channel utilization meter (C twin of /mnt/storage/wifi_analyzer
+ * util_meter + util_store), adapted for S31 MAC v3 rx_ctrl
+ * (esp_wifi_rxctrl_t / cur_bb_format + he_siga*).
+ *
+ * The RX callback stays entirely in C (WiFi driver task: integer math
+ * only). During the sweep the LVGL adapter is paused so PSRAM panel
+ * paint/flush cannot overlap promiscuous RX on the Mosaico MSPI path.
+ * ===================================================================== */
+
+static const char *UTIL_TAG = "wa-util";
+
+#define UTIL_CH_MIN 1
+#define UTIL_CH_MAX 13
+#define UTIL_NCHAN (UTIL_CH_MAX - UTIL_CH_MIN + 1)
+#define UTIL_DWELL_MS 100
+#define UTIL_MAX_FRAME_US 20000
+#define UTIL_STORE_TTL_MS 10000
+
+static uint16_t s_permille[UTIL_NCHAN];
+static uint32_t s_last_ms[UTIL_NCHAN];
+static uint32_t s_revision;
+static SemaphoreHandle_t s_util_mutex;
+
+static volatile uint8_t g_cur_ch;
+static volatile uint32_t g_busy_us;
+
+void wa_util_init(void)
+{
+    if (s_util_mutex == NULL) {
+        s_util_mutex = xSemaphoreCreateMutex();
+    }
+    memset(s_permille, 0, sizeof(s_permille));
+    memset(s_last_ms, 0, sizeof(s_last_ms));
+    s_revision = 0;
+}
+
+static void util_store_set(uint8_t ch, uint16_t permille, uint32_t now_ms)
+{
+    if (ch < UTIL_CH_MIN || ch > UTIL_CH_MAX || s_util_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_util_mutex, portMAX_DELAY);
+    s_permille[ch - UTIL_CH_MIN] = permille;
+    s_last_ms[ch - UTIL_CH_MIN] = now_ms;
+    ++s_revision;
+    xSemaphoreGive(s_util_mutex);
+}
+
+/* Pascal UI: 0..1000, or -1 if never probed / TTL expired. */
+/* Exact twin of wifi_analyzer main/ui/channel_view.c util_band_color(). */
+uint32_t wa_util_band_rgb(int permille)
+{
+    if (permille < 0) {
+        permille = 0;
+    }
+    if (permille > 1000) {
+        permille = 1000;
+    }
+    uint16_t h = (uint16_t)(220 - (220 * (unsigned)permille) / 1000);
+    uint8_t v = (uint8_t)(16 + (13 * (unsigned)permille) / 1000);
+    lv_color_t lc = lv_color_hsv_to_rgb(h, 85, v);
+    return ((uint32_t)lc.red << 16) | ((uint32_t)lc.green << 8) | (uint32_t)lc.blue;
+}
+
+int wa_util_channel_pm(int ch)
+{
+    if (ch < UTIL_CH_MIN || ch > UTIL_CH_MAX || s_util_mutex == NULL) {
+        return -1;
+    }
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    xSemaphoreTake(s_util_mutex, portMAX_DELAY);
+    const uint32_t last = s_last_ms[ch - UTIL_CH_MIN];
+    const uint16_t pm = s_permille[ch - UTIL_CH_MIN];
+    xSemaphoreGive(s_util_mutex);
+    if (last == 0 || now < last || (now - last) > UTIL_STORE_TTL_MS) {
+        return -1;
+    }
+    return (int)pm;
+}
+
+uint32_t wa_util_revision(void)
+{
+    if (s_util_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_util_mutex, portMAX_DELAY);
+    const uint32_t rev = s_revision;
+    xSemaphoreGive(s_util_mutex);
+    return rev;
+}
+
+/* Airtime from S31 rx_ctrl: same model as the discarded Pascal
+ * FrameAirtimeUs (preamble + sig_len*8/rate), with HT MCS from he_siga1. */
+static uint32_t frame_airtime_us(const wifi_pkt_rx_ctrl_t *c)
+{
+    uint32_t mbps_x10 = 0;
+    uint32_t pre = 20;
+    const unsigned fmt = c->cur_bb_format;
+    const unsigned rate = c->rate;
+    const unsigned sig_len = c->sig_len;
+
+    if (sig_len == 0) {
+        return 0;
+    }
+
+    if (fmt == RX_BB_FORMAT_11B) {
+        switch (rate) {
+        case 0: mbps_x10 = 10; pre = 192; break; /* long 1M */
+        case 1: mbps_x10 = 20; pre = 192; break;
+        case 2: mbps_x10 = 55; pre = 192; break;
+        case 3: mbps_x10 = 110; pre = 192; break;
+        case 5: mbps_x10 = 20; pre = 96; break; /* short */
+        case 6: mbps_x10 = 55; pre = 96; break;
+        case 7: mbps_x10 = 110; pre = 96; break;
+        default: return 0;
+        }
+    } else if (fmt == RX_BB_FORMAT_11G) {
+        switch (rate) {
+        case 8:  mbps_x10 = 480; break;
+        case 9:  mbps_x10 = 240; break;
+        case 10: mbps_x10 = 120; break;
+        case 11: mbps_x10 = 60; break;
+        case 12: mbps_x10 = 540; break;
+        case 13: mbps_x10 = 360; break;
+        case 14: mbps_x10 = 180; break;
+        case 15: mbps_x10 = 90; break;
+        default: return 0;
+        }
+        pre = 20;
+    } else if (fmt == RX_BB_FORMAT_HT) {
+        unsigned mcs = c->he_siga1 & 0x7Fu;
+        unsigned cwb = (c->he_siga1 >> 7) & 1u;
+        unsigned sgi = (c->he_siga2 >> 7) & 1u; /* HT-SIG2 Short GI */
+        static const uint16_t ht20[8] = {65, 130, 195, 260, 390, 520, 585, 650};
+        mbps_x10 = ht20[mcs % 8];
+        mbps_x10 *= (1u + mcs / 8u);
+        if (cwb) {
+            mbps_x10 = mbps_x10 * 207 / 100;
+        }
+        if (sgi) {
+            mbps_x10 = mbps_x10 * 10 / 9;
+        }
+        pre = 26;
+    } else {
+        /* VHT/HE: nominal MCS7 20 MHz; SIG encoding not fully documented */
+        mbps_x10 = 650;
+        pre = 60;
+    }
+
+    if (mbps_x10 == 0) {
+        return 0;
+    }
+    uint32_t air = pre + (uint32_t)sig_len * 80u / mbps_x10;
+    return air > UTIL_MAX_FRAME_US ? UTIL_MAX_FRAME_US : air;
+}
+
+static void util_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    (void)type;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const wifi_pkt_rx_ctrl_t *c = &pkt->rx_ctrl;
+
+    if (c->channel != g_cur_ch) {
+        return;
+    }
+    if (c->sig_len < 16) {
+        return;
+    }
+    g_busy_us += frame_airtime_us(c);
+}
+
+/* Prepare sniffer once; Pascal then calls wa_util_dwell_channel per ch and
+ * yields for LVGL paint between dwells (promiscuous is off during yield). */
+void wa_util_sweep_begin(void)
+{
+    const wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA |
+                       WIFI_PROMIS_FILTER_MASK_CTRL,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(util_rx_cb);
+    g_cur_ch = 0;
+}
+
+/* One channel: pause LVGL → promiscuous dwell → store → sniff off → resume.
+ * Caller must keep WalkActive set across this call; clear it afterward and
+ * delay so the UI tick can paint the updated column. */
+void wa_util_dwell_channel(int ch)
+{
+    if (ch < UTIL_CH_MIN || ch > UTIL_CH_MAX) {
+        return;
+    }
+
+    esp_err_t perr = esp_lv_adapter_pause(-1);
+    if (perr != ESP_OK) {
+        ESP_LOGW(UTIL_TAG, "adapter pause ch%d: %s", ch, esp_err_to_name(perr));
+    }
+
+    g_busy_us = 0;
+    g_cur_ch = (uint8_t)ch;
+    esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
+
+    esp_err_t err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(UTIL_TAG, "promiscuous enable ch%d: %s", ch, esp_err_to_name(err));
+        g_cur_ch = 0;
+        if (perr == ESP_OK) {
+            esp_lv_adapter_resume();
+        }
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(UTIL_DWELL_MS));
+
+    uint32_t busy = g_busy_us;
+    if (busy > UTIL_DWELL_MS * 1000u) {
+        busy = UTIL_DWELL_MS * 1000u;
+    }
+    uint16_t permille = (uint16_t)(busy * 1000u / (UTIL_DWELL_MS * 1000u));
+    util_store_set((uint8_t)ch, permille, (uint32_t)(esp_timer_get_time() / 1000));
+
+    g_cur_ch = 0;
+    esp_wifi_set_promiscuous(false);
+    /* brief settle before paint may touch PSRAM */
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    if (perr == ESP_OK) {
+        esp_lv_adapter_resume();
+    }
+}
+
+void wa_util_sweep_end(void)
+{
+    g_cur_ch = 0;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    vTaskDelay(pdMS_TO_TICKS(80));
+
+    ESP_LOGI(UTIL_TAG,
+             "sweep pm = %d %d %d %d %d %d %d %d %d %d %d %d %d",
+             wa_util_channel_pm(1), wa_util_channel_pm(2), wa_util_channel_pm(3),
+             wa_util_channel_pm(4), wa_util_channel_pm(5), wa_util_channel_pm(6),
+             wa_util_channel_pm(7), wa_util_channel_pm(8), wa_util_channel_pm(9),
+             wa_util_channel_pm(10), wa_util_channel_pm(11), wa_util_channel_pm(12),
+             wa_util_channel_pm(13));
+}
+
+/* Back-compat single-shot (unused by Pascal now). */
+void wa_util_sweep_once(void)
+{
+    wa_util_sweep_begin();
+    for (uint8_t ch = UTIL_CH_MIN; ch <= UTIL_CH_MAX; ++ch) {
+        wa_util_dwell_channel(ch);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    wa_util_sweep_end();
 }
