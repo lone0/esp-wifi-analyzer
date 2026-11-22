@@ -99,8 +99,10 @@ var
   i: integer;
   bssid: TBssid;
   now_ms: longword;
+  t0: longword;   { this scan's start: the seen/not-seen boundary }
 begin
   GetMem(recs, SizeOf(TRecordArray));
+  t0 := longword(esp_timer_get_time div 1000);
   try
     num := 0;
     err := esp_wifi_scan_start(@scan_cfg, 1);
@@ -131,6 +133,9 @@ begin
     writeln(TAGmsg, ': I scan: ', num, ' APs (store ', APStoreCount, ')');
   finally
     FreeMem(recs);
+    APStoreSweepMisses(t0);   { every cycle: reset/increment misses, evict at 2 }
+    APStoreAssignColors;      { then promote top-3 uncolored APs (freed
+                                slots re-claimable in the same cycle) }
   end;
 end;
 

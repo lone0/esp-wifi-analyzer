@@ -140,6 +140,10 @@ begin
     nets[i].channel := snap[i].channel;
     nets[i].width_mhz := 20;   { TODO: map wifi_bandwidth_t per AP }
     nets[i].dbm := APLatestRssi(snap[i]);
+    if snap[i].color_idx <= High(chartsmodel.PALETTE) then
+      nets[i].color := chartsmodel.PALETTE[snap[i].color_idx]
+    else
+      nets[i].color := chartsmodel.PALETTE_OTHER;
   end;
 end;
 

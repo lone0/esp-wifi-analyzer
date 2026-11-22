@@ -85,6 +85,8 @@ type
     channel: integer;
     width_mhz: integer;
     dbm: integer;
+    color: LongWord;   { resolved render color: palette slot or the
+                         shared fallback }
   end;
 
   { per-channel occupancy per-mille; fixed bounds avoid open-array High
@@ -92,7 +94,9 @@ type
   TUtil13 = array[0..12] of integer;
 
 const
-  { colors[i mod 8] from ChannelDrawingArea._draw line 1047 }
+  { the 8 exclusive palette slots (colors[0..7] of the C app's palette,
+    ChannelDrawingArea._draw line 1047) - granted per AP by apstore's
+    APStoreAssignColors, lifetime until eviction }
   PALETTE: array[0..PALETTE_SIZE - 1] of LongWord = (
     $3399FF,  { 0.2, 0.6, 1.0 }
     $FF664D,  { 1.0, 0.4, 0.3 }
@@ -103,6 +107,8 @@ const
     $FF8000,  { 1.0, 0.5, 0.0 }
     $9999FF   { 0.6, 0.6, 1.0 }
   );
+  { the 9th, shared: every uncolored AP renders with this }
+  PALETTE_OTHER: LongWord = $8C8C8C;   { neutral gray for the uncolored }
 
 { channel-axis map: channels 1..13 across the plot width }
 function ChAxis(plot_w: integer): TAxisMap;
@@ -223,7 +229,7 @@ begin
   begin
     if i >= MAX_CURVES then
       continue;
-    color := PALETTE[i mod PALETTE_SIZE];
+    color := nets[i].color;
     center := nets[i].channel;
     bw := nets[i].width_mhz / 10;
     if bw < 1 then
@@ -255,7 +261,7 @@ begin
     AddLabel(labels,
       PlotRound(AxPix(ax, nets[i].channel)) - PlotRound(Length(label_s) * 2.5),
       PlotRound(AxPix(ay, nets[i].dbm)) - 6,
-      label_s, PALETTE[i mod PALETTE_SIZE]);
+      label_s, nets[i].color);
   end;
 
   { focused-channel dashed highlight, lines 1088-1096 }
@@ -323,7 +329,7 @@ begin
   begin
     if i >= MAX_CURVES then
       continue;
-    color := PALETTE[i mod PALETTE_SIZE];
+    color := nets[i].color;
     center := nets[i].channel;
     bw := nets[i].width_mhz / 10;
     if bw < 1 then

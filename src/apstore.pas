@@ -4,6 +4,18 @@
   a stable palette slot for chart coloring, a monotonic revision counter
   the UI repaint gate reads, and a strongest-first sorted snapshot copy.
 
+  DELIBERATE DEVIATIONS from the C store:
+  - an entry that misses two consecutive scans is evicted
+    (APStoreSweepMisses, called by the scanner at every cycle end) -
+    freshness over history; the C original keeps stale entries until
+    the LRU replace;
+  - colors are an EXCLUSIVE pool of AP_PALETTE_SLOTS slots + one shared
+    fallback (AP_COLOR_NONE): an uncolored AP whose latest RSSI ranks
+    in the top 3 claims the lowest free slot for its lifetime
+    (APStoreAssignColors, same cycle-end hook); eviction returns the
+    slot to the pool. The C original hands out round-robin colors to
+    every newcomer and shares them once slots run out.
+
   Task safety: one mutex (esp_semphr) protects the shared entries.
   Pascal threads must be initialized before this unit is used by tasks. }
 
@@ -20,6 +32,8 @@ const
   AP_STORE_MAX_APS = 64;
   AP_HIST_LEN = 96;
   AP_PALETTE_SLOTS = 8;
+  { not a pool slot: render with the shared fallback color }
+  AP_COLOR_NONE = AP_PALETTE_SLOTS;
 
   { RSSI sentinel: never produced by esp_wifi (real RSSI >= -128) }
   AP_RSSI_NONE = -128;
@@ -36,6 +50,7 @@ type
     hist_count: byte;
     last_seen_ms: longword;
     color_idx: byte;
+    miss_count: byte;   { consecutive scans that did not see this BSSID }
   end;
   TAPEntries = array of TAPEntry;
 
@@ -58,6 +73,19 @@ function APStoreRevision: longword;
   snapshot the UI paints; returns the number of entries written }
 function APStoreCopySorted(out out_entries: TAPEntries): integer;
 
+{ end-of-scan bookkeeping: entries seen by the scan that started at
+  scan_started_ms reset their miss count; the rest increment it; two
+  consecutive misses evict (see the header note). Runs every cycle,
+  empty or failed scans included. }
+procedure APStoreSweepMisses(const scan_started_ms: longword);
+
+{ end-of-scan color promotion: walk the RSSI-sorted top 3; uncolored
+  entries claim the lowest free palette slot for their lifetime (the
+  pool may be empty - then nobody promotes this cycle). Runs after
+  APStoreSweepMisses so slots freed by eviction are re-claimable
+  immediately. }
+procedure APStoreAssignColors;
+
 { newest sample of an entry (its sort key) }
 function APLatestRssi(const e: TAPEntry): shortint;
 
@@ -66,7 +94,7 @@ implementation
 var
   entries: array[0..AP_STORE_MAX_APS - 1] of TAPEntry;
   entry_count: integer = 0;
-  next_color: byte = 0;
+  color_used: array[0..AP_PALETTE_SLOTS - 1] of boolean;
   revision: longword = 0;
   mutex: pointer;
 
@@ -76,7 +104,7 @@ begin
   if mutex = nil then
     RunError(203);
   entry_count := 0;
-  next_color := 0;
+  FillChar(color_used, SizeOf(color_used), 0);
   revision := 0;
 end;
 
@@ -119,8 +147,8 @@ begin
       entries[idx].bssid[3] := bssid[3];
       entries[idx].bssid[4] := bssid[4];
       entries[idx].bssid[5] := bssid[5];
-      entries[idx].color_idx := next_color;
-      next_color := (next_color + 1) mod AP_PALETTE_SLOTS;
+      entries[idx].color_idx := AP_COLOR_NONE;   { colors are granted by
+                                    APStoreAssignColors, not at add time }
       if idx = entry_count then
         Inc(entry_count);
     end;
@@ -166,6 +194,87 @@ begin
   if e.hist_count = 0 then
     exit(AP_RSSI_NONE);
   Result := e.rssi_hist[(e.hist_head + e.hist_count - 1) mod AP_HIST_LEN];
+end;
+
+procedure APStoreSweepMisses(const scan_started_ms: longword);
+var
+  i: integer;
+begin
+  xSemaphoreTake(mutex, $FFFFFFFF);
+  try
+    i := 0;
+    while i < entry_count do
+    begin
+      if entries[i].last_seen_ms >= scan_started_ms then
+        entries[i].miss_count := 0
+      else
+        Inc(entries[i].miss_count);
+      if entries[i].miss_count >= 2 then
+      begin
+        { recycle the palette slot, then swap-remove: iteration order is
+          irrelevant (reads sort a copy) }
+        if entries[i].color_idx < AP_PALETTE_SLOTS then
+          color_used[entries[i].color_idx] := False;
+        if i < entry_count - 1 then
+          entries[i] := entries[entry_count - 1];
+        Dec(entry_count);
+        Inc(revision);
+        { do not Inc(i): the swapped-in entry is not examined yet }
+      end
+      else
+        Inc(i);
+    end;
+  finally
+    xSemaphoreGive(mutex);
+  end;
+end;
+
+procedure APStoreAssignColors;
+var
+  order: array[0..AP_STORE_MAX_APS - 1] of integer;
+  i, j, n, t, k, slot: integer;
+begin
+  xSemaphoreTake(mutex, $FFFFFFFF);
+  try
+    n := entry_count;
+    for i := 0 to n - 1 do
+      order[i] := i;
+    { insertion sort by latest RSSI, strongest first (same comparator
+      as APStoreCopySorted) }
+    for i := 1 to n - 1 do
+    begin
+      t := order[i];
+      j := i - 1;
+      while (j >= 0) and (APLatestRssi(entries[order[j]]) < APLatestRssi(entries[t])) do
+      begin
+        order[j + 1] := order[j];
+        Dec(j);
+      end;
+      order[j + 1] := t;
+    end;
+    for i := 0 to 2 do
+    begin
+      if i >= n then
+        break;
+      if entries[order[i]].color_idx = AP_COLOR_NONE then
+      begin
+        slot := -1;
+        for k := 0 to AP_PALETTE_SLOTS - 1 do
+          if not color_used[k] then
+          begin
+            slot := k;
+            break;
+          end;
+        if slot < 0 then
+          break;   { pool empty: no promotions this cycle }
+        color_used[slot] := True;
+        entries[order[i]].color_idx := slot;
+        Inc(revision);
+      end;
+    end;
+  finally
+    xSemaphoreGive(mutex);
+  end;
 end;
 
 function APStoreCopySorted(out out_entries: TAPEntries): integer;
