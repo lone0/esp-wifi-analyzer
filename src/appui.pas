@@ -69,7 +69,6 @@ implementation
 
 type
   TlvTimerCb = procedure(timer: pointer); cdecl;
-  TDoubleArray = array of Double;
 
 { app-side LVGL growth (the submodule is frozen; these land back in
   esp-units' c_lvgl when it next evolves) }
@@ -147,35 +146,48 @@ begin
   end;
 end;
 
-{ the strongest AP's ring as signal percentages, oldest -> newest
-  (C app's rssi_to_pct: -100 dBm -> 0%, -45 dBm -> 100%) }
-function PctsOfStrongest: TDoubleArray;
+{ the strongest 6 APs' rings as C-style history lines (C history_view.c):
+  percent = (rssi+100)*100/55 clamped; color = the AP's palette slot or
+  the shared gray; name = 8-char SSID or '(hidden)' }
+procedure BuildHistLines(out lines: THistLines);
 var
-  i, n, pct: integer;
+  i, k, n, pct: integer;
 begin
-  SetLength(Result, 0);
-  if Length(snap) = 0 then
-    exit;
-  n := snap[0].hist_count;
-  if n < 2 then
-    exit;
-  SetLength(Result, n);
-  for i := 0 to n - 1 do
+  SetLength(lines, 0);
+  for i := 0 to Length(snap) - 1 do
   begin
-    pct := (snap[0].rssi_hist[(snap[0].hist_head + i) mod AP_HIST_LEN]
-      + 100) * 100 div 55;
-    if pct < 0 then
-      pct := 0;
-    if pct > 100 then
-      pct := 100;
-    Result[i] := pct;
+    if Length(lines) >= 6 then
+      break;
+    if snap[i].hist_count < 2 then
+      continue;
+    SetLength(lines, Length(lines) + 1);
+    if snap[i].color_idx <= High(chartsmodel.PALETTE) then
+      lines[High(lines)].color := chartsmodel.PALETTE[snap[i].color_idx]
+    else
+      lines[High(lines)].color := chartsmodel.PALETTE_OTHER;
+    if snap[i].ssid <> '' then
+      lines[High(lines)].name := Copy(snap[i].ssid, 1, 8)
+    else
+      lines[High(lines)].name := '(hidden)';
+    n := snap[i].hist_count;
+    SetLength(lines[High(lines)].pts, n);
+    for k := 0 to n - 1 do
+    begin
+      pct := (snap[i].rssi_hist[(snap[i].hist_head + k) mod AP_HIST_LEN]
+        + 100) * 100 div 55;
+      if pct < 0 then
+        pct := 0;
+      if pct > 100 then
+        pct := 100;
+      lines[High(lines)].pts[k] := pct;
+    end;
   end;
 end;
 
 procedure RepaintActive;
 var
   labels: TChartLabels;
-  pts: TDoubleArray;
+  hlines: THistLines;
   util: TUtil13;
   ch: integer;
 begin
@@ -185,8 +197,8 @@ begin
     0: DrawChannelView(Plot, nets, 0, util, labels);
     1:
     begin
-      pts := PctsOfStrongest;
-      DrawHistoryView(Plot, pts, labels);
+      BuildHistLines(hlines);
+      DrawHistoryView(Plot, hlines, labels);
     end;
   end;
   SyncLabels(labels);

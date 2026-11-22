@@ -74,7 +74,9 @@ const
   HI_MT = 18;
   HI_MB = 30;
 
-  { curves/labels caps (C wifi_analyzer: MAX_CURVES 24, palette 8) }
+  { caps: MAX_CURVES 24 is ours (C caps at 12 for its ~280 ms vector
+    rasterization; our raster path is far cheaper). The C label cap is
+    10. PALETTE_SIZE is the exclusive color pool size. }
   MAX_CURVES = 24;
   PALETTE_SIZE = 8;
 
@@ -129,9 +131,24 @@ procedure DrawChannelView(const p: TPlot; const nets: array of TNet;
 procedure PatchChannelUtilColumn(const p: TPlot; ch: integer;
   util_pm: integer; const nets: array of TNet);
 
-{ SignalHistoryDrawingArea._draw: one AP's history as signal percentages
-  (0..100, oldest first) - the polyline the reference draws. }
-procedure DrawHistoryView(const p: TPlot; const pts: array of Double;
+{ THistLine - one AP's history polyline payload (appui builds them from
+  the strongest snapshot entries; the drawer renders them C-style) }
+type
+  TPctArray = array of Double;   { 0..100 percentages, oldest -> newest }
+  THistLine = record
+    color: LongWord;   { resolved render color (palette slot or gray) }
+    name: string;      { SSID truncated to 8 chars, '(hidden)' if empty }
+    pts: TPctArray;
+  end;
+  THistLines = array of THistLine;
+
+{ history view, C history_view.c port (supersedes the app.py single-line
+  reference): the strongest 6 APs each get one polyline over a fixed
+  60-sample scrolling window (right-aligned while the ring fills),
+  weakest painted first, every line in its AP's own color; legend strip
+  along the bottom (chip + 8-char SSID per rank slot, empty slots
+  blank). Percent = (rssi+100)*100/55 clamped, the C formula. }
+procedure DrawHistoryView(const p: TPlot; const lines: THistLines;
   out labels: TChartLabels);
 
 implementation
@@ -166,7 +183,10 @@ var
   bw, center, amp: Double;
   s: TSeries;
   label_s: string;
+  tx, ty, tw, tries, np: integer;
+  collided: boolean;
   x0, x1: integer;
+  placed: array[0..9] of record x0, y0, x1, y1: integer; end;
   grid_h: array[0..8] of Double;    { -100..-20 step 10 }
   grid_v: array[0..12] of Double;   { 1..13 }
   gst: TGridStyle;
@@ -250,18 +270,50 @@ begin
     PlotSeriesFillBaseline(p, s, ax, ay, DBM_MIN, fst, sst);
   end;
 
-  { SSID labels for the strongest PALETTE_SIZE, lines 1082-1086 }
+  { SSID labels, strongest 10 (C MAX_LABELS), 16-char truncation.
+    Placement: x anchored at the AP's channel peak (+2 px, clamped to
+    the right edge); y starts at the curve peak and DESCENDS 13 px per
+    collision against already-placed label rectangles - names spread
+    down the plot instead of crowding the top (the pct mapping packs
+    real-world RSSI into the upper half, leaving the bottom empty). }
+  np := 0;
   for i := 0 to High(nets) do
   begin
-    if i >= PALETTE_SIZE then
+    if i >= 10 then
       break;
-    label_s := Copy(nets[i].ssid, 1, 18);
+    label_s := Copy(nets[i].ssid, 1, 16);
     if label_s = '' then
       label_s := '(hidden)';
-    AddLabel(labels,
-      PlotRound(AxPix(ax, nets[i].channel)) - PlotRound(Length(label_s) * 2.5),
-      PlotRound(AxPix(ay, nets[i].dbm)) - 6,
-      label_s, nets[i].color);
+    tx := PlotRound(AxPix(ax, nets[i].channel)) + 2;
+    tw := Length(label_s) * 9 + 4;
+    if tx + tw > p.W - 4 then
+      tx := p.W - 4 - tw;
+    ty := PlotRound(AxPix(ay, nets[i].dbm)) - 10;
+    { greedy descent: step down until the rectangle is free }
+    for tries := 1 to 25 do
+    begin
+      collided := False;
+      for k := 0 to np - 1 do
+        if (tx < placed[k].x1) and (tx + tw > placed[k].x0) and
+           (ty < placed[k].y1) and (ty + 18 > placed[k].y0) then
+        begin
+          ty := ty + 13;
+          collided := True;
+          break;
+        end;
+      if not collided then
+        break;
+    end;
+    if ty < 12 then
+      ty := 12;
+    if ty > HI_MT + plot_h - 16 then
+      ty := HI_MT + plot_h - 16;
+    placed[np].x0 := tx;
+    placed[np].x1 := tx + tw;
+    placed[np].y0 := ty;
+    placed[np].y1 := ty + 18;
+    Inc(np);
+    AddLabel(labels, tx, ty, label_s, nets[i].color);
   end;
 
   { focused-channel dashed highlight, lines 1088-1096 }
@@ -350,35 +402,26 @@ begin
   end;
 end;
 
-procedure DrawHistoryView(const p: TPlot; const pts: array of Double;
+procedure DrawHistoryView(const p: TPlot; const lines: THistLines;
   out labels: TChartLabels);
+const
+  HIST_WINDOW = 60;
 var
   plot_w, plot_h: integer;
   ax, ay: TAxisMap;
-  i, n: integer;
+  i, li, m, k: integer;
   s: TSeries;
   hst: TStrokeStyle;
   gst: TGridStyle;
   grid_v: array[0..4] of Double;
 begin
   SetLength(labels, 0);
-  PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);   { paint, line 1181 }
+  PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);
 
   plot_w := p.W - HI_ML - HI_MR;
   plot_h := p.H - HI_MT - HI_MB;
-  n := Length(pts);
 
-  { percent Y axis: 0% at the plot bottom, 100% at the top. Must be set
-    BEFORE PlotGridH - previously ay was still uninitialized here, so the
-    history gridlines landed at garbage Y while the labels (which used the
-    closed-form pixel formula) looked fine. }
-  ay.Pix0 := HI_MT + plot_h;
-  ay.Pix1 := HI_MT;
-  ay.Val0 := 0;
-  ay.Val1 := 100;
-
-  { percent gridlines + "N%" labels, lines 1189-1197; cairo's DEFAULT
-    width 2 (that method never calls set_line_width) at alpha 0.35 }
+  { percent gridlines + "N%" labels, 25% steps }
   gst.Color := HGRID_HEX;
   gst.Alpha := HGRID_A;
   gst.WidthPx := 2;
@@ -389,28 +432,50 @@ begin
     AddLabel(labels, 4, PlotRound(AxPix(ay, grid_v[i])) + 4,
       IntToStr(i * 25) + '%', DIM_H_HEX);
 
-  if n < 2 then
+  if Length(lines) = 0 then
   begin
     AddLabel(labels, 20, p.H div 2, 'No local signal history yet', DIM_H_HEX);
     exit;
   end;
 
-  { the signal polyline, lines 1198-1206; x spread over the point index
-    (line 1191) }
-  SetLength(s, n);
+  { one polyline per AP, strongest 6; right-aligned over the 60-sample
+    scrolling window, weakest painted first (C history_view.c) }
   ax.Pix0 := HI_ML;
   ax.Pix1 := HI_ML + plot_w;
   ax.Val0 := 0;
-  ax.Val1 := n - 1;
-  for i := 0 to n - 1 do
+  ax.Val1 := HIST_WINDOW - 1;
+  ay.Pix0 := HI_MT + plot_h;
+  ay.Pix1 := HI_MT;
+  ay.Val0 := 0;
+  ay.Val1 := 100;
+  for li := High(lines) downto 0 do
   begin
-    s[i].X := i;
-    s[i].Y := pts[i];
+    m := Length(lines[li].pts);
+    if m < 2 then
+      continue;
+    if m > HIST_WINDOW then
+      m := HIST_WINDOW;
+    SetLength(s, m);
+    for k := 0 to m - 1 do
+    begin
+      s[k].X := k + (HIST_WINDOW - m);
+      s[k].Y := lines[li].pts[Length(lines[li].pts) - m + k];
+    end;
+    hst.Color := lines[li].color;
+    hst.Alpha := 255;
+    hst.WidthPx := 2;
+    PlotSeriesLine(p, s, ax, ay, hst);
   end;
-  hst.Color := HIST_HEX;
-  hst.Alpha := 255;
-  hst.WidthPx := 2;
-  PlotSeriesLine(p, s, ax, ay, hst);
+
+  { legend strip along the bottom (C history_view.c): 79 px pitch fills
+    the 480 px width; chip 8x8 at slot top+3, label baseline slot+10 }
+  for li := 0 to High(lines) do
+  begin
+    if Length(lines[li].pts) < 2 then
+      continue;
+    PlotFillRect(p, 6 + li * 79, p.H - 19, 8, 8, lines[li].color, 255);
+    AddLabel(labels, 18 + li * 79, p.H - 13, lines[li].name, lines[li].color);
+  end;
 end;
 
 end.
