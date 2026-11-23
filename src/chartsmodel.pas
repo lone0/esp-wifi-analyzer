@@ -251,10 +251,8 @@ begin
     if i >= MAX_CURVES then
       continue;
     color := nets[i].color;
-    k := nets[i].channel;
-    center := k;
-    k := nets[i].width_mhz;
-    bw := k / 10;
+    center := nets[i].channel;
+    bw := nets[i].width_mhz / 10;
     if bw < 1 then
       bw := 1;
 
@@ -287,13 +285,11 @@ begin
     label_s := Copy(nets[i].ssid, 1, 16);
     if label_s = '' then
       label_s := '(hidden)';
-    k := nets[i].channel;
-    tx := PlotRound(AxPix(ax, k)) + 2;
+    tx := PlotRound(AxPix(ax, nets[i].channel)) + 2;
     tw := Length(label_s) * 9 + 4;
     if tx + tw > p.W - 4 then
       tx := p.W - 4 - tw;
-    k := nets[i].dbm;
-    ty := PlotRound(AxPix(ay, k)) - 10;
+    ty := PlotRound(AxPix(ay, nets[i].dbm)) - 10;
     { greedy descent: step down until the rectangle is free }
     for tries := 1 to 25 do
     begin
@@ -368,6 +364,8 @@ begin
     PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(util_pm), 255)
   else
     PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, 0, 255);
+  { clear the 2 baseline stroke rows below plot_h so bell/grid alpha does not accumulate }
+  PlotFillRect(p, x0, CH_MT + plot_h, x1 - x0 + 1, 2, 0, 255);
 
   { horizontal grid segments across this strip }
   gst.Color := GRID_HEX;
@@ -379,7 +377,7 @@ begin
     PlotFillRect(p, x0, gy, x1 - x0 + 1, 1, gst.Color, gst.Alpha);
   end;
   { vertical channel line }
-  PlotFillRect(p, PlotRound(AxPix(ax, ch)), CH_MT, 1, plot_h, gst.Color, gst.Alpha);
+  PlotFillRect(p, PlotRound(AxPix(ax, ch)), CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
 
   { restore bell pixels that fall in this strip }
   for i := High(nets) downto 0 do
@@ -387,10 +385,8 @@ begin
     if i >= MAX_CURVES then
       continue;
     color := nets[i].color;
-    k := nets[i].channel;
-    center := k;
-    k := nets[i].width_mhz;
-    bw := k / 10;
+    center := nets[i].channel;
+    bw := nets[i].width_mhz / 10;
     if bw < 1 then
       bw := 1;
     SetLength(s, 61);

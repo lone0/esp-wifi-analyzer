@@ -199,7 +199,7 @@ begin
   for xi := x0 to x1 do
   begin
     i := 0;
-    while (i < High(s)) and (AxPix(ax, s[i + 1].X) < xi) do
+    while (i < High(s) - 1) and (AxPix(ax, s[i + 1].X) < xi) do
       Inc(i);
     if AxPix(ax, s[i + 1].X) = AxPix(ax, s[i].X) then
       frac := 0

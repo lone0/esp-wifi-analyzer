@@ -237,10 +237,10 @@ begin
     x1 := CH_ML + plot_w;
   if x1 < x0 then
     exit;
-  area.x1 := CANVAS_X + x0;
-  area.y1 := CANVAS_Y + CH_MT;
-  area.x2 := CANVAS_X + x1;
-  area.y2 := CANVAS_Y + CH_MT + plot_h - 1;
+  area.x1 := (CANVAS_X + x0) and (not 1);
+  area.y1 := (CANVAS_Y + CH_MT) and (not 1);
+  area.x2 := (CANVAS_X + x1) or 1;
+  area.y2 := (CANVAS_Y + CH_MT + plot_h + 1) or 1;
   lv_obj_invalidate_area(canvas_obj, area);
 end;
 

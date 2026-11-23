@@ -164,6 +164,16 @@ static void wa_prof_disp_cb(lv_event_t *e)
     }
 }
 
+static void wa_co5300_rounder_cb(lv_area_t *area, void *user_data)
+{
+    (void)user_data;
+    /* CO5300 CASET/RASET require 2-pixel alignment (even start, odd end). */
+    area->x1 &= ~1;
+    area->y1 &= ~1;
+    area->x2 |= 1;
+    area->y2 |= 1;
+}
+
 static void wa_touch_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -207,6 +217,7 @@ bool wa_touch_indicator_start(lv_indev_t *indev)
 
     lv_display_t *disp = lv_display_get_default();
     if (disp != NULL) {
+        (void)esp_lv_adapter_set_area_rounder_cb(disp, wa_co5300_rounder_cb, NULL);
         lv_display_add_event_cb(disp, wa_prof_disp_cb, LV_EVENT_ALL, NULL);
     }
     return true;
