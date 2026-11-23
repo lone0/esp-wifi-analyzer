@@ -32,9 +32,9 @@ const
   BAR_W = SCREEN_W - 8;   { 472 }
   BAR_H = 36;
 
-  { chart canvas: (0,44)-(480,480), ARGB8888 }
+  { chart canvas: (0,40)-(480,480), ARGB8888 (touches bottom of status bar) }
   CANVAS_X = 0;
-  CANVAS_Y = 44;
+  CANVAS_Y = 40;
   CANVAS_W = SCREEN_W;
   CANVAS_H = SCREEN_H - CANVAS_Y;
 
@@ -101,6 +101,8 @@ function wa_touch_indicator_start(indev: pointer): cbool; cdecl; external;
 procedure wa_ui_bus_acquire; cdecl; external;
 procedure wa_gesture_attach(target: plv_obj_t; cb: TWaGestureCb); cdecl; external;
 procedure wa_gesture_set_state(active_view, panel_open: cint32); cdecl; external;
+procedure wa_battery_widget_create(bar: plv_obj_t); cdecl; external;
+procedure wa_battery_widget_update; cdecl; external;
 
 var
   canvas_obj: plv_obj_t;
@@ -122,6 +124,7 @@ var
   drawn_util_rev: longword = 0;
   last_ap_count: longint = -1;
   last_scan_busy: shortint = -1;
+  last_bat_poll_us: int64 = 0;
   snap: TAPEntries;
   nets: array of TNet;
 
@@ -259,10 +262,10 @@ begin
   ax := ChAxis(plot_w);
   x0 := PlotRound(AxPix(ax, ch - 0.5));
   x1 := PlotRound(AxPix(ax, ch + 0.5));
-  if x0 < CH_ML then
-    x0 := CH_ML;
-  if x1 > CH_ML + plot_w then
-    x1 := CH_ML + plot_w;
+  if x0 < 0 then
+    x0 := 0;
+  if x1 >= CANVAS_W then
+    x1 := CANVAS_W - 1;
   if x1 < x0 then
     exit;
   area.x1 := (CANVAS_X + x0) and (not 1);
@@ -319,6 +322,13 @@ begin
     else
       lv_obj_set_style_bg_color(dot, ColorMake((SCAN_OFF shr 16) and $FF,
         (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
+  end;
+
+  tp0 := esp_timer_get_time;
+  if (last_bat_poll_us = 0) or (tp0 - last_bat_poll_us >= 5000000) then
+  begin
+    last_bat_poll_us := tp0;
+    wa_battery_widget_update;
   end;
 
   { Forced full redraw (after scan / after util sweep). Clear the flag
@@ -604,11 +614,11 @@ begin
   lv_label_set_text(title, 'WiFi Analyzer');
   lv_obj_set_style_text_color(title,
     ColorMake($FF, $FF, $FF), LV_STYLE_MAIN);
-  lv_obj_set_pos(title, 20, 10);   { >=24 px from the screen corner }
+  lv_obj_set_pos(title, 18, 10);
 
   dot := lv_obj_create(bar);
   lv_obj_set_size(dot, 10, 10);
-  lv_obj_set_pos(dot, 180, 13);
+  lv_obj_set_pos(dot, 148, 13);
   lv_obj_set_style_border_width(dot, 0, LV_STYLE_MAIN);
   lv_obj_set_style_bg_color(dot, ColorMake((SCAN_OFF shr 16) and $FF,
     (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
@@ -620,7 +630,9 @@ begin
   lv_obj_set_style_text_color(ap_label,
     ColorMake((TEXT_DIM shr 16) and $FF, (TEXT_DIM shr 8) and $FF,
       TEXT_DIM and $FF), LV_STYLE_MAIN);
-  lv_obj_set_pos(ap_label, 200, 10);
+  lv_obj_set_pos(ap_label, 164, 10);
+
+  wa_battery_widget_create(bar);
 
   for i := 0 to VIEW_COUNT - 1 do
   begin

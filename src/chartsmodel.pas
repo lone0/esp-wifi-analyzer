@@ -59,9 +59,9 @@ const
   GRID_A   = 38;
 
   { ChannelDrawingArea margins + axis ranges }
-  CH_ML = 50;
+  CH_ML = 20;
   CH_MR = 20;
-  CH_MT = 20;
+  CH_MT = 0;
   CH_MB = 40;
   CH_MIN = 1;
   CH_MAX = 13;
@@ -69,8 +69,8 @@ const
   DBM_MAX = -20;
 
   { SignalHistoryDrawingArea margins (aligned with CH view Y-axis) }
-  HI_ML = CH_ML;
-  HI_MR = CH_MR;
+  HI_ML = 42;
+  HI_MR = 18;
   HI_MT = CH_MT;
   HI_MB = CH_MB;
 
@@ -253,17 +253,17 @@ begin
   ay := DbmAxis(plot_h);
 
   { occupancy bands under grid/curves — C util_band_color per permille.
-    util_pm[i]: 0..1000, -1 = no data (stays black). Clip to the plot
-    so ch1/ch13 do not paint into the dBm / right margins. }
+    util_pm[i]: 0..1000, -1 = no data (stays black). Extend across the
+    full width [0..p.W-1] so ch1's column renders behind the Y-axis labels. }
   for i := 0 to 12 do
   begin
     k := util_pm[i];
     x0 := PlotRound(AxPix(ax, (i + 1) - 0.5));
     x1 := PlotRound(AxPix(ax, (i + 1) + 0.5));
-    if x0 < CH_ML then
-      x0 := CH_ML;
-    if x1 > CH_ML + plot_w then
-      x1 := CH_ML + plot_w;
+    if x0 < 0 then
+      x0 := 0;
+    if x1 >= p.W then
+      x1 := p.W - 1;
     if (x1 >= x0) and (k >= 0) then
       PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
   end;
@@ -274,18 +274,22 @@ begin
   gst.Color := GRID_HEX;
   gst.Alpha := GRID_A;
   gst.WidthPx := 1;
-  PlotGridH(p, grid_h, ay, CH_ML, CH_ML + plot_w, gst);
+  PlotGridH(p, grid_h, ay, 0, p.W - 1, gst);
   for i := 0 to 6 do
-    AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
-      IntToStr(DBM_MIN + i * 10), DIM_HEX);
+  begin
+    ty := PlotRound(AxPix(ay, grid_h[i])) + 4;
+    if ty < 15 then
+      ty := 15;
+    AddLabel(labels, 4, ty, IntToStr(DBM_MIN + i * 10), DIM_HEX);
+  end;
 
-  { vertical channel gridlines + tick labels (clipped to [CH_ML..CH_ML+plot_w]) }
+  { vertical channel gridlines + tick labels across [0..p.W-1] }
   if ChViewEnd <= 20 then
   begin
     for i := 1 to 14 do
     begin
       tx := PlotRound(AxPix(ax, i));
-      if (tx >= CH_ML) and (tx <= CH_ML + plot_w) then
+      if (tx >= 0) and (tx < p.W) then
       begin
         PlotFillRect(p, tx, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
         AddLabel(labels, tx - 5, p.H - CH_MB + 15, IntToStr(i), DIM_HEX);
@@ -299,7 +303,7 @@ begin
     while i <= 165 do
     begin
       tx := PlotRound(AxPix(ax, i));
-      if (tx >= CH_ML) and (tx <= CH_ML + plot_w) then
+      if (tx >= 0) and (tx < p.W) then
       begin
         PlotFillRect(p, tx, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
         AddLabel(labels, tx - 8, p.H - CH_MB + 15, IntToStr(i), DIM_HEX);
@@ -339,7 +343,7 @@ begin
     sst.Color := color;
     sst.Alpha := STROKE_A;
     sst.WidthPx := 2;
-    PlotSeriesFillBaselineClip(p, s, ax, ay, DBM_MIN, fst, sst, CH_ML, CH_ML + plot_w);
+    PlotSeriesFillBaselineClip(p, s, ax, ay, DBM_MIN, fst, sst, 0, p.W - 1);
   end;
 
   { SSID labels, strongest 10 (C MAX_LABELS), 16-char truncation.
@@ -356,7 +360,7 @@ begin
     if nets[i].dbm < DBM_MIN then
       continue;
     tx := PlotRound(AxPix(ax, nets[i].channel));
-    if (tx < CH_ML) or (tx > CH_ML + plot_w) then
+    if (tx < 0) or (tx >= p.W) then
       continue;
     tx := tx + 2;
     label_s := Copy(nets[i].ssid, 1, 16);
@@ -365,8 +369,8 @@ begin
     tw := Length(label_s) * 9 + 4;
     if tx + tw > p.W - 4 then
       tx := p.W - 4 - tw;
-    if tx < CH_ML then
-      tx := CH_ML;
+    if tx < 4 then
+      tx := 4;
     ty := PlotRound(AxPix(ay, nets[i].dbm)) - 10;
     { greedy descent: step down until the rectangle is free }
     for tries := 1 to 25 do
@@ -428,12 +432,10 @@ begin
   ay := DbmAxis(plot_h);
   x0 := PlotRound(AxPix(ax, ch - 0.5));
   x1 := PlotRound(AxPix(ax, ch + 0.5));
-  { ch1 extends left of CH_ML (dBm gutter); ch13 past the right edge —
-    keep util paint inside the plot so the strength column stays stable. }
-  if x0 < CH_ML then
-    x0 := CH_ML;
-  if x1 > CH_ML + plot_w then
-    x1 := CH_ML + plot_w;
+  if x0 < 0 then
+    x0 := 0;
+  if x1 >= p.W then
+    x1 := p.W - 1;
   if x1 < x0 then
     exit;
 
@@ -520,8 +522,12 @@ begin
     grid_h[i] := DBM_MIN + i * 10;
   PlotGridH(p, grid_h, ay, HI_ML, HI_ML + plot_w, gst);
   for i := 0 to 6 do
-    AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
-      IntToStr(DBM_MIN + i * 10), DIM_H_HEX);
+  begin
+    k := PlotRound(AxPix(ay, grid_h[i])) + 4;
+    if k < 15 then
+      k := 15;
+    AddLabel(labels, 4, k, IntToStr(DBM_MIN + i * 10), DIM_H_HEX);
+  end;
 
   if Length(lines) = 0 then
   begin

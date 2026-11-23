@@ -36,6 +36,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "driver/i2c_master.h"
+#include "esp_board_manager.h"
 
 static void wa_console_flush_task(void *arg)
 {
@@ -867,4 +869,231 @@ void wa_util_sweep_once(void)
         vTaskDelay(pdMS_TO_TICKS(120));
     }
     wa_util_sweep_end();
+}
+
+/* --- BQ27220 Fuel Gauge Reader & Cell-Phone Style Battery Widget --- */
+static i2c_master_dev_handle_t s_bq_dev;
+static bool s_bq_init_tried;
+static lv_obj_t *s_bat_body;
+static lv_obj_t *s_bat_fill;
+static lv_obj_t *s_bat_cap;
+static lv_obj_t *s_bat_pct_lbl;
+static int32_t s_last_bat_soc = -2;
+static int32_t s_last_bat_chg = -2;
+
+/* Mosaico 11-point DOD voltage curve (100% down to 0% in 10% steps, mV)
+ * from managed_components/espressif__esp_boards/esp_mosaico/battery_monitor.c */
+static const uint16_t s_mosaico_dod_mv[11] = {
+    4147, /* 100% */
+    4002, /*  90% */
+    3969, /*  80% */
+    3938, /*  70% */
+    3880, /*  60% */
+    3824, /*  50% */
+    3794, /*  40% */
+    3753, /*  30% */
+    3677, /*  20% */
+    3574, /*  10% */
+    3490  /*   0% */
+};
+
+static uint16_t wa_soc_from_dod_mv(uint16_t mv)
+{
+    if (mv >= s_mosaico_dod_mv[0]) {
+        return 100;
+    }
+    if (mv <= s_mosaico_dod_mv[10]) {
+        if (mv <= 3000) {
+            return 0;
+        }
+        return (uint16_t)((mv - 3000) * 10 / (s_mosaico_dod_mv[10] - 3000));
+    }
+    for (int i = 0; i < 10; i++) {
+        uint16_t v_hi = s_mosaico_dod_mv[i];
+        uint16_t v_lo = s_mosaico_dod_mv[i + 1];
+        if (mv <= v_hi && mv >= v_lo) {
+            uint16_t base_soc = (uint16_t)((9 - i) * 10);
+            if (v_hi == v_lo) {
+                return base_soc;
+            }
+            return (uint16_t)(base_soc + (mv - v_lo) * 10 / (v_hi - v_lo));
+        }
+    }
+    return 50;
+}
+
+static bool wa_bq_read_u16(uint8_t reg, uint16_t *out_val)
+{
+    if (s_bq_dev == NULL) {
+        return false;
+    }
+    uint8_t buf[2] = {0, 0};
+    if (i2c_master_transmit_receive(s_bq_dev, &reg, 1, buf, 2, 50) != ESP_OK) {
+        return false;
+    }
+    *out_val = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+    return true;
+}
+
+int wa_battery_read(int32_t *out_soc, int32_t *out_charging)
+{
+    if (!s_bq_init_tried) {
+        s_bq_init_tried = true;
+        i2c_master_bus_handle_t bus = NULL;
+        if (esp_board_manager_get_periph_handle("i2c_master", (void **)&bus) == ESP_OK &&
+            bus != NULL) {
+            const i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = 0x55,
+                .scl_speed_hz = 400000,
+            };
+            (void)i2c_master_bus_add_device(bus, &dev_cfg, &s_bq_dev);
+        }
+    }
+    if (s_bq_dev == NULL) {
+        return -1;
+    }
+    uint16_t raw_soc = 0;
+    uint16_t mv = 0;
+    uint16_t cur_u16 = 0;
+    uint16_t dcap = 0;
+    if (!wa_bq_read_u16(0x2C, &raw_soc) || !wa_bq_read_u16(0x08, &mv)) {
+        return -1;
+    }
+    if (mv < 1000 || mv > 5500) {
+        return -1;
+    }
+    (void)wa_bq_read_u16(0x0C, &cur_u16);
+    (void)wa_bq_read_u16(0x3C, &dcap);
+    int16_t cur_ma = (int16_t)cur_u16;
+
+    /* If the BQ27220 still holds its factory 3000 mAh DesignCapacity instead of
+     * Mosaico's 65 mAh cell profile, raw_soc is scaled by 65/3000 (~2-5%).
+     * Use the Mosaico 11-point DOD voltage curve whenever dcap != 65. */
+    uint16_t soc = raw_soc;
+    if (dcap != 65 || raw_soc > 100 || (mv >= 3750 && raw_soc < 20)) {
+        soc = wa_soc_from_dod_mv(mv);
+    }
+
+    int32_t chg = (cur_ma > 3) ? 1 : 0;
+    if (out_soc != NULL) {
+        *out_soc = (int32_t)soc;
+    }
+    if (out_charging != NULL) {
+        *out_charging = chg;
+    }
+    if ((int32_t)soc != s_last_bat_soc || chg != s_last_bat_chg) {
+        printf("BAT: mv=%u mV cur=%d mA raw_soc=%u%% dcap=%u mAh -> soc=%u%% chg=%ld\n",
+               (unsigned)mv, (int)cur_ma, (unsigned)raw_soc, (unsigned)dcap,
+               (unsigned)soc, (long)chg);
+    }
+    return 0;
+}
+
+void wa_battery_widget_update(void)
+{
+    if (s_bat_body == NULL || s_bat_fill == NULL || s_bat_pct_lbl == NULL) {
+        return;
+    }
+    int32_t soc = -1;
+    int32_t chg = 0;
+    if (wa_battery_read(&soc, &chg) != 0) {
+        soc = -1;
+        chg = 0;
+    }
+    if (soc == s_last_bat_soc && chg == s_last_bat_chg) {
+        return;
+    }
+    s_last_bat_soc = soc;
+    s_last_bat_chg = chg;
+
+    char buf[24];
+    if (soc < 0) {
+        snprintf(buf, sizeof(buf), "--%%");
+        lv_label_set_text(s_bat_pct_lbl, buf);
+        lv_obj_set_style_text_color(s_bat_pct_lbl, lv_color_hex(0x9AA0A6), 0);
+        lv_obj_set_size(s_bat_fill, 0, 8);
+        return;
+    }
+
+    if (chg != 0) {
+        snprintf(buf, sizeof(buf), "%ld%% " LV_SYMBOL_CHARGE, (long)soc);
+    } else {
+        snprintf(buf, sizeof(buf), "%ld%%", (long)soc);
+    }
+    lv_label_set_text(s_bat_pct_lbl, buf);
+
+    uint32_t fill_hex;
+    if (chg != 0) {
+        fill_hex = 0x34C759; /* iOS charging green */
+    } else if (soc >= 30) {
+        fill_hex = 0x4ADE80; /* healthy green */
+    } else if (soc >= 15) {
+        fill_hex = 0xFBBF24; /* low battery amber */
+    } else {
+        fill_hex = 0xF87171; /* critical red */
+    }
+
+    int32_t fill_w = (soc * 22 + 50) / 100;
+    if (soc > 0 && fill_w < 2) {
+        fill_w = 2;
+    }
+    if (fill_w > 22) {
+        fill_w = 22;
+    }
+    lv_obj_set_size(s_bat_fill, fill_w, 8);
+    lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(fill_hex), 0);
+    lv_obj_set_style_text_color(s_bat_pct_lbl,
+                                lv_color_hex(chg ? 0x34C759 : 0xE5E9F0), 0);
+}
+
+void wa_battery_widget_create(lv_obj_t *bar)
+{
+    if (bar == NULL) {
+        return;
+    }
+    /* Percentage + charging bolt text on the left of the battery icon */
+    s_bat_pct_lbl = lv_label_create(bar);
+    lv_obj_set_style_text_font(s_bat_pct_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_bat_pct_lbl, lv_color_hex(0xE5E9F0), 0);
+    lv_label_set_text(s_bat_pct_lbl, "--%");
+    lv_obj_set_pos(s_bat_pct_lbl, 232, 10);
+
+    /* Rounded cell-phone battery shell (28x14, 2px border, 22x8 interior) */
+    s_bat_body = lv_obj_create(bar);
+    lv_obj_set_pos(s_bat_body, 288, 11);
+    lv_obj_set_size(s_bat_body, 28, 14);
+    lv_obj_set_style_radius(s_bat_body, 4, 0);
+    lv_obj_set_style_bg_color(s_bat_body, lv_color_hex(0x14161A), 0);
+    lv_obj_set_style_border_width(s_bat_body, 2, 0);
+    lv_obj_set_style_border_color(s_bat_body, lv_color_hex(0xD0D7DE), 0);
+    lv_obj_set_style_pad_all(s_bat_body, 1, 0);
+    lv_obj_set_scrollable(s_bat_body, false);
+    lv_obj_set_clickable(s_bat_body, false);
+
+    /* Proportional inner charge level bar */
+    s_bat_fill = lv_obj_create(s_bat_body);
+    lv_obj_set_pos(s_bat_fill, 0, 0);
+    lv_obj_set_size(s_bat_fill, 0, 8);
+    lv_obj_set_style_radius(s_bat_fill, 2, 0);
+    lv_obj_set_style_border_width(s_bat_fill, 0, 0);
+    lv_obj_set_style_pad_all(s_bat_fill, 0, 0);
+    lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(0x4ADE80), 0);
+    lv_obj_set_scrollable(s_bat_fill, false);
+    lv_obj_set_clickable(s_bat_fill, false);
+
+    /* Positive terminal cap nub on the right side of the battery shell */
+    s_bat_cap = lv_obj_create(bar);
+    lv_obj_set_pos(s_bat_cap, 317, 15);
+    lv_obj_set_size(s_bat_cap, 3, 6);
+    lv_obj_set_style_radius(s_bat_cap, 1, 0);
+    lv_obj_set_style_border_width(s_bat_cap, 0, 0);
+    lv_obj_set_style_pad_all(s_bat_cap, 0, 0);
+    lv_obj_set_style_bg_color(s_bat_cap, lv_color_hex(0xD0D7DE), 0);
+    lv_obj_set_scrollable(s_bat_cap, false);
+    lv_obj_set_clickable(s_bat_cap, false);
+
+    s_last_bat_soc = -2;
+    s_last_bat_chg = -2;
+    wa_battery_widget_update();
 }
