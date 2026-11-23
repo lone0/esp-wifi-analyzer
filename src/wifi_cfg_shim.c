@@ -74,6 +74,63 @@ static lv_obj_t *wa_touch_dot;
 static uint32_t wa_touch_last;
 static bool wa_touch_seen;
 
+/* --- UI-First Preemptive MSPI / Sniffer Exclusivity ---
+ * Instead of pausing LVGL during channel dwells, LVGL runs continuously
+ * and preempts any in-progress promiscuous dwell as soon as touch or
+ * display invalidation/refresh occurs. */
+static SemaphoreHandle_t s_mspi_sem;
+static SemaphoreHandle_t s_abort_sem;
+static volatile int s_ui_want_bus;
+static bool s_ui_has_bus;
+
+void wa_ui_bus_acquire(void)
+{
+    s_ui_want_bus = 1;
+    __sync_synchronize();
+    if (!s_ui_has_bus) {
+        if (s_abort_sem != NULL) {
+            xSemaphoreGive(s_abort_sem);
+        }
+        if (s_mspi_sem != NULL) {
+            xSemaphoreTake(s_mspi_sem, portMAX_DELAY);
+        }
+        s_ui_has_bus = true;
+    }
+}
+
+static void wa_ui_bus_release_if_idle(lv_display_t *disp)
+{
+    if (!s_ui_has_bus) {
+        return;
+    }
+    if (wa_touch_indev != NULL &&
+        lv_indev_get_state(wa_touch_indev) == LV_INDEV_STATE_PRESSED) {
+        return;
+    }
+    if (disp == NULL) {
+        disp = lv_display_get_default();
+    }
+    if (disp != NULL &&
+        (disp->inv_p > 0 || disp->rendering_in_progress || disp->flushing)) {
+        return;
+    }
+    s_ui_has_bus = false;
+    s_ui_want_bus = 0;
+    __sync_synchronize();
+    if (s_mspi_sem != NULL) {
+        xSemaphoreGive(s_mspi_sem);
+    }
+}
+
+void wa_ui_wait_idle(int timeout_ms)
+{
+    int waited = 0;
+    while (s_ui_want_bus && waited < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        waited += 5;
+    }
+}
+
 /* --- LVGL & LCD DMA Timing Profiler --- */
 static int64_t s_prof_refr_start_us;
 static int64_t s_prof_render_start_us;
@@ -92,7 +149,11 @@ static void wa_prof_disp_cb(lv_event_t *e)
     int64_t now = esp_timer_get_time();
 
     switch (code) {
+    case LV_EVENT_INVALIDATE_AREA:
+        wa_ui_bus_acquire();
+        break;
     case LV_EVENT_REFR_START:
+        wa_ui_bus_acquire();
         s_prof_refr_start_us = now;
         s_prof_wait_sum_us = 0;
         s_prof_flush_call_sum_us = 0;
@@ -159,6 +220,11 @@ static void wa_prof_disp_cb(lv_event_t *e)
         }
         break;
     }
+    case LV_EVENT_REFR_READY:
+        while (disp && disp->flushing) {
+        }
+        wa_ui_bus_release_if_idle(disp);
+        break;
     default:
         break;
     }
@@ -174,19 +240,32 @@ static void wa_co5300_rounder_cb(lv_area_t *area, void *user_data)
     area->y2 |= 1;
 }
 
+static void wa_indev_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING ||
+        code == LV_EVENT_SHORT_CLICKED || code == LV_EVENT_CLICKED) {
+        wa_ui_bus_acquire();
+    }
+}
+
 static void wa_touch_tick(lv_timer_t *timer)
 {
     (void)timer;
     if (lv_indev_get_state(wa_touch_indev) == LV_INDEV_STATE_PRESSED) {
+        wa_ui_bus_acquire();
         lv_point_t p;
         lv_indev_get_point(wa_touch_indev, &p);
         lv_obj_set_pos(wa_touch_dot, p.x - 6, p.y - 6);
         lv_obj_set_hidden(wa_touch_dot, false);
         wa_touch_last = lv_tick_get();
         wa_touch_seen = true;
-    } else if (wa_touch_seen && lv_tick_elaps(wa_touch_last) >= 500) {
-        lv_obj_set_hidden(wa_touch_dot, true);
-        wa_touch_seen = false;
+    } else {
+        if (wa_touch_seen && lv_tick_elaps(wa_touch_last) >= 500) {
+            lv_obj_set_hidden(wa_touch_dot, true);
+            wa_touch_seen = false;
+        }
+        wa_ui_bus_release_if_idle(NULL);
     }
 }
 
@@ -209,11 +288,13 @@ bool wa_touch_indicator_start(lv_indev_t *indev)
     lv_obj_set_scrollable(wa_touch_dot, false);
     lv_obj_set_clickable(wa_touch_dot, false);
     lv_obj_set_hidden(wa_touch_dot, true);
-    if (lv_timer_create(wa_touch_tick, 30, NULL) == NULL) {
+    if (lv_timer_create(wa_touch_tick, 15, NULL) == NULL) {
         lv_obj_delete(wa_touch_dot);
         wa_touch_dot = NULL;
         return false;
     }
+
+    lv_indev_add_event_cb(indev, wa_indev_event_cb, LV_EVENT_ALL, NULL);
 
     lv_display_t *disp = lv_display_get_default();
     if (disp != NULL) {
@@ -299,6 +380,15 @@ void wa_util_init(void)
 {
     if (s_util_mutex == NULL) {
         s_util_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_mspi_sem == NULL) {
+        s_mspi_sem = xSemaphoreCreateBinary();
+        if (s_mspi_sem != NULL) {
+            xSemaphoreGive(s_mspi_sem);
+        }
+    }
+    if (s_abort_sem == NULL) {
+        s_abort_sem = xSemaphoreCreateBinary();
     }
     memset(s_permille, 0, sizeof(s_permille));
     memset(s_last_ms, 0, sizeof(s_last_ms));
@@ -453,18 +543,30 @@ void wa_util_sweep_begin(void)
     g_cur_ch = 0;
 }
 
-/* One channel: pause LVGL → promiscuous dwell → store → sniff off → resume.
- * Caller must keep WalkActive set across this call; clear it afterward and
- * delay so the UI tick can paint the updated column. */
-void wa_util_dwell_channel(int ch)
+/* One channel: acquire MSPI exclusivity → abortable promiscuous dwell →
+ * sniff off → release MSPI. Returns 1 on completed dwell, 0 if preempted by
+ * UI/touch (caller should wait for UI idle and retry ch), or -1 on error. */
+int wa_util_dwell_channel(int ch)
 {
     if (ch < UTIL_CH_MIN || ch > UTIL_CH_MAX) {
-        return;
+        return -1;
     }
 
-    esp_err_t perr = esp_lv_adapter_pause(-1);
-    if (perr != ESP_OK) {
-        ESP_LOGW(UTIL_TAG, "adapter pause ch%d: %s", ch, esp_err_to_name(perr));
+    if (s_ui_want_bus) {
+        return 0;
+    }
+    if (s_mspi_sem != NULL) {
+        xSemaphoreTake(s_mspi_sem, portMAX_DELAY);
+    }
+    if (s_abort_sem != NULL) {
+        xSemaphoreTake(s_abort_sem, 0);
+    }
+    __sync_synchronize();
+    if (s_ui_want_bus) {
+        if (s_mspi_sem != NULL) {
+            xSemaphoreGive(s_mspi_sem);
+        }
+        return 0;
     }
 
     g_busy_us = 0;
@@ -475,29 +577,45 @@ void wa_util_dwell_channel(int ch)
     if (err != ESP_OK) {
         ESP_LOGE(UTIL_TAG, "promiscuous enable ch%d: %s", ch, esp_err_to_name(err));
         g_cur_ch = 0;
-        if (perr == ESP_OK) {
-            esp_lv_adapter_resume();
+        if (s_mspi_sem != NULL) {
+            xSemaphoreGive(s_mspi_sem);
         }
-        return;
+        return -1;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(UTIL_DWELL_MS));
-
+    int64_t t_start = esp_timer_get_time();
+    BaseType_t aborted = pdFALSE;
+    if (s_abort_sem != NULL) {
+        aborted = xSemaphoreTake(s_abort_sem, pdMS_TO_TICKS(UTIL_DWELL_MS));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(UTIL_DWELL_MS));
+    }
+    int64_t elapsed_us = esp_timer_get_time() - t_start;
     uint32_t busy = g_busy_us;
+
+    g_cur_ch = 0;
+    esp_wifi_set_promiscuous(false);
+    /* brief settle so any in-flight RX DMA descriptor drains before PSRAM burst */
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    if (aborted == pdTRUE || s_ui_want_bus) {
+        ESP_LOGI(UTIL_TAG, "dwell ch%d preempted by UI after %lld us", ch, (long long)elapsed_us);
+        if (s_mspi_sem != NULL) {
+            xSemaphoreGive(s_mspi_sem);
+        }
+        return 0;
+    }
+
     if (busy > UTIL_DWELL_MS * 1000u) {
         busy = UTIL_DWELL_MS * 1000u;
     }
     uint16_t permille = (uint16_t)(busy * 1000u / (UTIL_DWELL_MS * 1000u));
     util_store_set((uint8_t)ch, permille, (uint32_t)(esp_timer_get_time() / 1000));
 
-    g_cur_ch = 0;
-    esp_wifi_set_promiscuous(false);
-    /* brief settle before paint may touch PSRAM */
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    if (perr == ESP_OK) {
-        esp_lv_adapter_resume();
+    if (s_mspi_sem != NULL) {
+        xSemaphoreGive(s_mspi_sem);
     }
+    return 1;
 }
 
 void wa_util_sweep_end(void)
@@ -505,7 +623,7 @@ void wa_util_sweep_end(void)
     g_cur_ch = 0;
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    vTaskDelay(pdMS_TO_TICKS(80));
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     ESP_LOGI(UTIL_TAG,
              "sweep pm = %d %d %d %d %d %d %d %d %d %d %d %d %d",

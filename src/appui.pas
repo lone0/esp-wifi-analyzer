@@ -86,6 +86,7 @@ procedure lv_obj_set_style_border_width(obj: plv_obj_t; value: cint32;
 procedure lv_obj_set_style_pad_all(obj: plv_obj_t; value: cint32;
   selector: cuint); cdecl; external;
 function wa_touch_indicator_start(indev: pointer): cbool; cdecl; external;
+procedure wa_ui_bus_acquire; cdecl; external;
 
 var
   canvas_obj: plv_obj_t;
@@ -199,6 +200,7 @@ var
   ch: integer;
   t0, t1, t2: int64;
 begin
+  wa_ui_bus_acquire;
   t0 := esp_timer_get_time;
   for ch := 0 to 12 do
     util[ch] := scanner.ChannelUtilPM(ch + 1);
@@ -259,6 +261,23 @@ begin
   util_rev := scanner.UtilRevision;
   count := APStoreCount;
 
+  { User-initiated view switch preempts everything immediately. }
+  if repaint_pending <> 0 then
+  begin
+    drawn_revision := rev;
+    drawn_util_rev := util_rev;
+    repaint_pending := 0;
+    if Length(nets) = 0 then
+      RefreshSnapshot;
+    RepaintActive;
+    exit;
+  end;
+
+  { While a background channel dwell runs and no user action is pending,
+    stay off the MSPI/PSRAM bus so the 100 ms dwell completes cleanly. }
+  if scanner.WalkActive <> 0 then
+    exit;
+
   if longint(count) <> last_ap_count then
   begin
     last_ap_count := longint(count);
@@ -276,12 +295,6 @@ begin
         (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
   end;
 
-  if scanner.WalkActive <> 0 then
-  begin
-    repaint_pending := 1;
-    exit;
-  end;
-
   { Forced full redraw (after scan / after util sweep). Clear the flag
     only after paint so the scanner handshake WaitUiPainted can proceed. }
   if scanner.UtilNeedFullPaint <> 0 then
@@ -296,36 +309,32 @@ begin
   end;
 
   { Between dwells: patch only the channel strip that just finished. }
-  if (scanner.UtilDeferPaint <> 0) and (scanner.UtilPatchCh <> 0) and
-    (active_view = 0) then
+  if (scanner.UtilDeferPaint <> 0) and (scanner.UtilPatchCh <> 0) then
   begin
-    if Length(nets) = 0 then
-      RefreshSnapshot;
     pch := scanner.UtilPatchCh;
-    tp0 := esp_timer_get_time;
-    PatchChannelUtilColumn(Plot, pch,
-      scanner.ChannelUtilPM(pch), nets);
-    tp1 := esp_timer_get_time;
-    InvalidateChannelStrip(pch);
+    if active_view = 0 then
+    begin
+      if Length(nets) = 0 then
+        RefreshSnapshot;
+      wa_ui_bus_acquire;
+      tp0 := esp_timer_get_time;
+      PatchChannelUtilColumn(Plot, pch,
+        scanner.ChannelUtilPM(pch), nets);
+      tp1 := esp_timer_get_time;
+      InvalidateChannelStrip(pch);
+      writeln('PROF-O2: ColPatch ch=', pch, ' nets=', Length(nets),
+        ' | patch_draw=', tp1 - tp0, ' us');
+    end;
     scanner.UtilPatchCh := 0;
     drawn_util_rev := util_rev;
-    writeln('PROF-O2: ColPatch ch=', pch, ' nets=', Length(nets),
-      ' | patch_draw=', tp1 - tp0, ' us');
     exit;
   end;
 
-  need_paint := (rev <> drawn_revision) or (util_rev <> drawn_util_rev) or
-    (repaint_pending <> 0);
-  if need_paint and (scanner.UtilDeferPaint <> 0) then
-  begin
-    repaint_pending := 1;
-    exit;
-  end;
-  if need_paint then
+  need_paint := (rev <> drawn_revision) or (util_rev <> drawn_util_rev);
+  if need_paint and (scanner.UtilDeferPaint = 0) then
   begin
     drawn_revision := rev;
     drawn_util_rev := util_rev;
-    repaint_pending := 0;
     RefreshSnapshot;
     RepaintActive;
   end;
@@ -340,12 +349,15 @@ begin
   v := PtrInt(lv_event_get_user_data(e));
   if (v >= 0) and (v < VIEW_COUNT) and (v <> active_view) then
   begin
+    { Preempt any active channel dwell immediately and repaint now. }
+    wa_ui_bus_acquire;
     SwitchView(v);
-    { never repaint from the event callback directly: a PSRAM paint
-      burst overlapping the promiscuous walk hard-hangs the MSPI
-      arbiter - mark it pending; the tick repaints in a walk-free
-      window (<= ~1.5 s) }
-    repaint_pending := 1;
+    drawn_revision := APStoreRevision;
+    drawn_util_rev := scanner.UtilRevision;
+    repaint_pending := 0;
+    if Length(nets) = 0 then
+      RefreshSnapshot;
+    RepaintActive;
   end;
 end;
 
@@ -460,12 +472,12 @@ begin
   end;
 
   { ---- first paint + the revision-gated tick ---- }
+  if not wa_touch_indicator_start(TBoardLvgl.Touch) then
+    writeln('WA: W touch indicator unavailable');
   SwitchView(0);
   RefreshSnapshot;
   RepaintActive;
-  lv_timer_create(@TickCb, 50, nil);
-  if not wa_touch_indicator_start(TBoardLvgl.Touch) then
-    writeln('WA: W touch indicator unavailable');
+  lv_timer_create(@TickCb, 15, nil);
 end;
 
 end.

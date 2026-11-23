@@ -63,10 +63,11 @@ var
 
 procedure wa_util_init; cdecl; external;
 procedure wa_util_sweep_begin; cdecl; external;
-procedure wa_util_dwell_channel(ch: cint); cdecl; external;
+function wa_util_dwell_channel(ch: cint): cint; cdecl; external;
 procedure wa_util_sweep_end; cdecl; external;
 function wa_util_channel_pm(ch: cint): cint; cdecl; external;
 function wa_util_revision: longword; cdecl; external;
+procedure wa_ui_wait_idle(timeout_ms: cint); cdecl; external;
 
 function ChannelUtilPM(ch: integer): integer;
 begin
@@ -78,7 +79,7 @@ begin
   Result := wa_util_revision;
 end;
 
-{ Spin until UI clears UtilNeedFullPaint (or timeout_ms). }
+{ Spin until UI clears UtilNeedFullPaint and finishes LVGL/DMA flush. }
 procedure WaitUiPainted(timeout_ms: integer);
 var
   waited: integer;
@@ -86,9 +87,24 @@ begin
   waited := 0;
   while (UtilNeedFullPaint <> 0) and (waited < timeout_ms) do
   begin
-    vTaskDelay(pdMS_TO_TICKS(20));
-    Inc(waited, 20);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    Inc(waited, 5);
   end;
+  wa_ui_wait_idle(timeout_ms);
+end;
+
+{ Spin until UI clears UtilPatchCh and finishes strip DMA flush. }
+procedure WaitChannelPatched(timeout_ms: integer);
+var
+  waited: integer;
+begin
+  waited := 0;
+  while (UtilPatchCh <> 0) and (waited < timeout_ms) do
+  begin
+    vTaskDelay(pdMS_TO_TICKS(5));
+    Inc(waited, 5);
+  end;
+  wa_ui_wait_idle(timeout_ms);
 end;
 
 procedure ScanAPs;
@@ -142,7 +158,7 @@ end;
 function ScanTaskFT(arg: pointer): ptrint;
 var
   cycle: integer = 0;
-  ch: integer;
+  ch, dwell_res: integer;
 begin
   Result := 0;
   writeln(TAGmsg, ': I worker up (16 KB, fthreads/TLS slot 1)');
@@ -163,16 +179,28 @@ begin
     if UtilNeedFullPaint <> 0 then
       writeln(TAGmsg, ': W UI paint ack timeout after scan');
 
-    { Per channel: dwell → UI patches that strip → next. }
+    { Per channel: abortable dwell → UI patches that strip → next. }
     UtilDeferPaint := 1;
     wa_util_sweep_begin;
-    for ch := 1 to 13 do
+    ch := 1;
+    while ch <= 13 do
     begin
       WalkActive := 1;
-      wa_util_dwell_channel(ch);
+      dwell_res := wa_util_dwell_channel(ch);
       WalkActive := 0;
-      UtilPatchCh := ch;   { tick patches this strip, then clears }
-      vTaskDelay(pdMS_TO_TICKS(UTIL_TOUCH_YIELD_MS));
+      if dwell_res > 0 then
+      begin
+        UtilPatchCh := ch;   { tick patches this strip, then clears }
+        WaitChannelPatched(300);
+        Inc(ch);
+      end
+      else if dwell_res = 0 then
+      begin
+        { Dwell preempted by UI/touch; wait for UI idle then retry ch }
+        wa_ui_wait_idle(500);
+      end
+      else
+        Inc(ch);
     end;
     UtilPatchCh := 0;
     wa_util_sweep_end;
