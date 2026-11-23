@@ -75,7 +75,7 @@ procedure PlotDashedVLine(const p: TPlot; x, y0, y1, w: integer;
 
 { app.py draws with float cairo coordinates; the raster world needs
   integers. Symmetric rounding (not banker's): 2.5 -> 3. }
-function PlotRound(v: Double): integer; inline;
+function PlotRound(v: Single): integer; inline;
 
 implementation
 
@@ -197,7 +197,7 @@ begin
   end;
 end;
 
-function PlotRound(v: Double): integer; inline;
+function PlotRound(v: Single): integer; inline;
 begin
   if v >= 0 then
     Result := Trunc(v + 0.5)

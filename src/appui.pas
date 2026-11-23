@@ -19,6 +19,7 @@ uses
   c_lvgl,           { LVGL 9.6 working subset (esp-units submodule) }
   boardlvgl,
   SysUtils,         { IntToStr }
+  c_wifi,           { esp_timer_get_time }
   chartdraw, chartplot, chartsmodel, apstore, scanner;
 
 const
@@ -69,6 +70,9 @@ implementation
 
 type
   TlvTimerCb = procedure(timer: pointer); cdecl;
+  TlvArea = record
+    x1, y1, x2, y2: cint32;
+  end;
 
 { app-side LVGL growth (the submodule is frozen; these land back in
   esp-units' c_lvgl when it next evolves) }
@@ -76,6 +80,7 @@ function lv_timer_create(cb: TlvTimerCb; period_ms: cuint;
   user_data: pointer): pointer; cdecl; external;
 function lv_event_get_user_data(e: plv_event_t): pointer; cdecl; external;
 function lv_obj_get_child(obj: plv_obj_t; idx: cint32): plv_obj_t; cdecl; external;
+function lv_obj_invalidate_area(obj: plv_obj_t; const area: TlvArea): cint; cdecl; external;
 procedure lv_obj_set_style_border_width(obj: plv_obj_t; value: cint32;
   selector: cuint); cdecl; external;
 procedure lv_obj_set_style_pad_all(obj: plv_obj_t; value: cint32;
@@ -190,7 +195,9 @@ var
   hlines: THistLines;
   util: TUtil13;
   ch: integer;
+  t0, t1, t2: int64;
 begin
+  t0 := esp_timer_get_time;
   for ch := 0 to 12 do
     util[ch] := scanner.ChannelUtilPM(ch + 1);
   case active_view of
@@ -201,8 +208,38 @@ begin
       DrawHistoryView(Plot, hlines, labels);
     end;
   end;
+  t1 := esp_timer_get_time;
   SyncLabels(labels);
   lv_obj_invalidate(canvas_obj);
+  t2 := esp_timer_get_time;
+  writeln('PROF-O2: FullRepaint view=', active_view, ' nets=', Length(nets),
+    ' | chartdraw=', t1 - t0, ' us | sync_labels=', t2 - t1, ' us');
+end;
+
+procedure InvalidateChannelStrip(ch: integer);
+var
+  plot_w, plot_h, x0, x1: integer;
+  ax: TAxisMap;
+  area: TlvArea;
+begin
+  if (ch < CH_MIN) or (ch > CH_MAX) then
+    exit;
+  plot_w := CANVAS_W - CH_ML - CH_MR;
+  plot_h := CANVAS_H - CH_MT - CH_MB;
+  ax := ChAxis(plot_w);
+  x0 := PlotRound(AxPix(ax, ch - 0.5));
+  x1 := PlotRound(AxPix(ax, ch + 0.5));
+  if x0 < CH_ML then
+    x0 := CH_ML;
+  if x1 > CH_ML + plot_w then
+    x1 := CH_ML + plot_w;
+  if x1 < x0 then
+    exit;
+  area.x1 := CANVAS_X + x0;
+  area.y1 := CANVAS_Y + CH_MT;
+  area.x2 := CANVAS_X + x1;
+  area.y2 := CANVAS_Y + CH_MT + plot_h - 1;
+  lv_obj_invalidate_area(canvas_obj, area);
 end;
 
 procedure TickCb(timer: pointer); cdecl;
@@ -210,6 +247,8 @@ var
   rev, util_rev, count: longword;
   status_buf: string;
   need_paint: boolean;
+  tp0, tp1: int64;
+  pch: integer;
 begin
   if canvas_buf = nil then
     exit;
@@ -252,11 +291,16 @@ begin
   begin
     if Length(nets) = 0 then
       RefreshSnapshot;
-    PatchChannelUtilColumn(Plot, scanner.UtilPatchCh,
-      scanner.ChannelUtilPM(scanner.UtilPatchCh), nets);
+    pch := scanner.UtilPatchCh;
+    tp0 := esp_timer_get_time;
+    PatchChannelUtilColumn(Plot, pch,
+      scanner.ChannelUtilPM(pch), nets);
+    tp1 := esp_timer_get_time;
+    InvalidateChannelStrip(pch);
     scanner.UtilPatchCh := 0;
     drawn_util_rev := util_rev;
-    lv_obj_invalidate(canvas_obj);
+    writeln('PROF-O2: ColPatch ch=', pch, ' nets=', Length(nets),
+      ' | patch_draw=', tp1 - tp0, ' us');
     exit;
   end;
 

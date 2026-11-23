@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
 #include "lvgl.h"
+#include "src/display/lv_display_private.h"
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -73,6 +74,96 @@ static lv_obj_t *wa_touch_dot;
 static uint32_t wa_touch_last;
 static bool wa_touch_seen;
 
+/* --- LVGL & LCD DMA Timing Profiler --- */
+static int64_t s_prof_refr_start_us;
+static int64_t s_prof_render_start_us;
+static int64_t s_prof_flush_start_us;
+static int64_t s_prof_wait_start_us;
+static int64_t s_prof_wait_sum_us;
+static int64_t s_prof_flush_call_sum_us;
+static uint32_t s_prof_flush_cnt;
+static uint32_t s_prof_total_px;
+static int32_t s_prof_x1, s_prof_y1, s_prof_x2, s_prof_y2;
+
+static void wa_prof_disp_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_display_t *disp = (lv_display_t *)lv_event_get_target(e);
+    int64_t now = esp_timer_get_time();
+
+    switch (code) {
+    case LV_EVENT_REFR_START:
+        s_prof_refr_start_us = now;
+        s_prof_wait_sum_us = 0;
+        s_prof_flush_call_sum_us = 0;
+        s_prof_flush_cnt = 0;
+        s_prof_total_px = 0;
+        break;
+    case LV_EVENT_RENDER_START:
+        s_prof_render_start_us = now;
+        break;
+    case LV_EVENT_FLUSH_WAIT_START:
+        s_prof_wait_start_us = now;
+        break;
+    case LV_EVENT_FLUSH_WAIT_FINISH:
+        if (s_prof_wait_start_us > 0) {
+            s_prof_wait_sum_us += (now - s_prof_wait_start_us);
+        }
+        break;
+    case LV_EVENT_FLUSH_START: {
+        s_prof_flush_start_us = now;
+        const lv_area_t *a = (const lv_area_t *)lv_event_get_param(e);
+        if (a) {
+            int32_t w = a->x2 - a->x1 + 1;
+            int32_t h = a->y2 - a->y1 + 1;
+            s_prof_total_px += (uint32_t)(w * h);
+            if (s_prof_flush_cnt == 0) {
+                s_prof_x1 = a->x1;
+                s_prof_y1 = a->y1;
+            }
+            s_prof_x2 = a->x2;
+            s_prof_y2 = a->y2;
+        }
+        s_prof_flush_cnt++;
+        break;
+    }
+    case LV_EVENT_FLUSH_FINISH:
+        s_prof_flush_call_sum_us += (now - s_prof_flush_start_us);
+        break;
+    case LV_EVENT_RENDER_READY: {
+        int64_t render_ready_us = now;
+        int64_t dma_tail_start = esp_timer_get_time();
+        while (disp && disp->flushing) {
+        }
+        int64_t dma_done_us = esp_timer_get_time();
+        int64_t last_dma_us = dma_done_us - s_prof_flush_start_us;
+        int64_t tail_after_render_ready_us = dma_done_us - dma_tail_start;
+        int64_t layout_us = s_prof_render_start_us - s_prof_refr_start_us;
+        int64_t render_total_us = render_ready_us - s_prof_render_start_us;
+        int64_t sw_draw_only_us = render_total_us - s_prof_wait_sum_us - s_prof_flush_call_sum_us;
+
+        if (s_prof_total_px > 2000 || s_prof_y2 > 100) {
+            printf("PROF-FRAME: area=(%ld,%ld..%ld,%ld) px=%lu flushes=%lu | "
+                   "layout=%lld us | render_start->ready=%lld us (sw_draw=%lld us, dma_wait=%lld us, flush_cb=%lld us) | "
+                   "last_dma_tx=%lld us (tail_after_ready=%lld us) | total_refr_to_dma_done=%lld us\n",
+                   (long)s_prof_x1, (long)s_prof_y1, (long)s_prof_x2, (long)s_prof_y2,
+                   (unsigned long)s_prof_total_px, (unsigned long)s_prof_flush_cnt,
+                   (long long)layout_us,
+                   (long long)render_total_us,
+                   (long long)sw_draw_only_us,
+                   (long long)s_prof_wait_sum_us,
+                   (long long)s_prof_flush_call_sum_us,
+                   (long long)last_dma_us,
+                   (long long)tail_after_render_ready_us,
+                   (long long)(dma_done_us - s_prof_refr_start_us));
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 static void wa_touch_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -112,6 +203,11 @@ bool wa_touch_indicator_start(lv_indev_t *indev)
         lv_obj_delete(wa_touch_dot);
         wa_touch_dot = NULL;
         return false;
+    }
+
+    lv_display_t *disp = lv_display_get_default();
+    if (disp != NULL) {
+        lv_display_add_event_cb(disp, wa_prof_disp_cb, LV_EVENT_ALL, NULL);
     }
     return true;
 }

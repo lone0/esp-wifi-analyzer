@@ -159,7 +159,7 @@ begin
 
     { Wait until the UI tick has drawn AP curves before util patches. }
     UtilNeedFullPaint := 1;
-    WaitUiPainted(800);
+    WaitUiPainted(1500);
     if UtilNeedFullPaint <> 0 then
       writeln(TAGmsg, ': W UI paint ack timeout after scan');
 
@@ -178,7 +178,7 @@ begin
     wa_util_sweep_end;
     UtilDeferPaint := 0;
     UtilNeedFullPaint := 1;  { reconcile util + AP curves after the sweep }
-    WaitUiPainted(800);
+    WaitUiPainted(1500);
     writeln(TAGmsg, ': I util sweep done');
 
     ScannerBusy := 0;

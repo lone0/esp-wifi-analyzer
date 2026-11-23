@@ -16,6 +16,7 @@ unit mosaicobmgrdeps;
 {$linklib esp_hal_i2s}
 {$linklib esp_hal_cam}
 {$linklib espressif__esp_sccb_intf}
+{$linklib espressif__esp_lcd_touch_cst9220}
 
 interface
 

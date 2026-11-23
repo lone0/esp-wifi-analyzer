@@ -134,7 +134,7 @@ procedure PatchChannelUtilColumn(const p: TPlot; ch: integer;
 { THistLine - one AP's history polyline payload (appui builds them from
   the strongest snapshot entries; the drawer renders them C-style) }
 type
-  TPctArray = array of Double;   { 0..100 percentages, oldest -> newest }
+  TPctArray = array of Single;   { 0..100 percentages, oldest -> newest }
   THistLine = record
     color: LongWord;   { resolved render color (palette slot or gray) }
     name: string;      { SSID truncated to 8 chars, '(hidden)' if empty }
@@ -155,6 +155,7 @@ implementation
 
 { C wifi_analyzer channel_view.c util_band_color via lv_color_hsv_to_rgb }
 function wa_util_band_rgb(permille: LongInt): LongWord; cdecl; external;
+function expf(x: Single): Single; cdecl; external;
 
 function ChAxis(plot_w: integer): TAxisMap;
 begin
@@ -180,15 +181,15 @@ var
   ax, ay: TAxisMap;
   i, k: integer;
   color: LongWord;
-  bw, center, amp: Double;
+  bw, center, amp: Single;
   s: TSeries;
   label_s: string;
   tx, ty, tw, tries, np: integer;
   collided: boolean;
   x0, x1: integer;
   placed: array[0..9] of record x0, y0, x1, y1: integer; end;
-  grid_h: array[0..8] of Double;    { -100..-20 step 10 }
-  grid_v: array[0..12] of Double;   { 1..13 }
+  grid_h: array[0..8] of Single;    { -100..-20 step 10 }
+  grid_v: array[0..12] of Single;   { 1..13 }
   gst: TGridStyle;
   fst: TFillStyle;
   sst: TStrokeStyle;
@@ -250,8 +251,10 @@ begin
     if i >= MAX_CURVES then
       continue;
     color := nets[i].color;
-    center := nets[i].channel;
-    bw := nets[i].width_mhz / 10;
+    k := nets[i].channel;
+    center := k;
+    k := nets[i].width_mhz;
+    bw := k / 10;
     if bw < 1 then
       bw := 1;
 
@@ -259,7 +262,7 @@ begin
     for k := 0 to 60 do
     begin
       s[k].X := center - bw * 2 + bw * 4 * k / 60;
-      amp := exp(-sqr((s[k].X - center) / bw) * 2);
+      amp := expf(-sqr((s[k].X - center) / bw) * 2);
       s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
     end;
     fst.Color := color;
@@ -284,11 +287,13 @@ begin
     label_s := Copy(nets[i].ssid, 1, 16);
     if label_s = '' then
       label_s := '(hidden)';
-    tx := PlotRound(AxPix(ax, nets[i].channel)) + 2;
+    k := nets[i].channel;
+    tx := PlotRound(AxPix(ax, k)) + 2;
     tw := Length(label_s) * 9 + 4;
     if tx + tw > p.W - 4 then
       tx := p.W - 4 - tw;
-    ty := PlotRound(AxPix(ay, nets[i].dbm)) - 10;
+    k := nets[i].dbm;
+    ty := PlotRound(AxPix(ay, k)) - 10;
     { greedy descent: step down until the rectangle is free }
     for tries := 1 to 25 do
     begin
@@ -334,7 +339,7 @@ var
   ax, ay: TAxisMap;
   i, k, x0, x1, gy: integer;
   color: LongWord;
-  bw, center, amp: Double;
+  bw, center, amp: Single;
   s: TSeries;
   gst: TGridStyle;
   fst: TFillStyle;
@@ -382,15 +387,17 @@ begin
     if i >= MAX_CURVES then
       continue;
     color := nets[i].color;
-    center := nets[i].channel;
-    bw := nets[i].width_mhz / 10;
+    k := nets[i].channel;
+    center := k;
+    k := nets[i].width_mhz;
+    bw := k / 10;
     if bw < 1 then
       bw := 1;
     SetLength(s, 61);
     for k := 0 to 60 do
     begin
       s[k].X := center - bw * 2 + bw * 4 * k / 60;
-      amp := exp(-sqr((s[k].X - center) / bw) * 2);
+      amp := expf(-sqr((s[k].X - center) / bw) * 2);
       s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
     end;
     fst.Color := color;
@@ -413,13 +420,22 @@ var
   s: TSeries;
   hst: TStrokeStyle;
   gst: TGridStyle;
-  grid_v: array[0..4] of Double;
+  grid_v: array[0..4] of Single;
 begin
   SetLength(labels, 0);
   PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);
 
   plot_w := p.W - HI_ML - HI_MR;
   plot_h := p.H - HI_MT - HI_MB;
+
+  ax.Pix0 := HI_ML;
+  ax.Pix1 := HI_ML + plot_w;
+  ax.Val0 := 0;
+  ax.Val1 := HIST_WINDOW - 1;
+  ay.Pix0 := HI_MT + plot_h;
+  ay.Pix1 := HI_MT;
+  ay.Val0 := 0;
+  ay.Val1 := 100;
 
   { percent gridlines + "N%" labels, 25% steps }
   gst.Color := HGRID_HEX;
@@ -440,14 +456,6 @@ begin
 
   { one polyline per AP, strongest 6; right-aligned over the 60-sample
     scrolling window, weakest painted first (C history_view.c) }
-  ax.Pix0 := HI_ML;
-  ax.Pix1 := HI_ML + plot_w;
-  ax.Val0 := 0;
-  ax.Val1 := HIST_WINDOW - 1;
-  ay.Pix0 := HI_MT + plot_h;
-  ay.Pix1 := HI_MT;
-  ay.Val0 := 0;
-  ay.Val1 := 100;
   for li := High(lines) downto 0 do
   begin
     m := Length(lines[li].pts);

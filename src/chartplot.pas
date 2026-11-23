@@ -42,12 +42,12 @@ type
   { linear value->pixel axis map: Val0 sits at pixel Pix0, Val1 at Pix1 }
   TAxisMap = record
     Pix0, Pix1: integer;
-    Val0, Val1: Double;
+    Val0, Val1: Single;
   end;
 
   { one series sample in VALUE space }
   TSeriesPt = record
-    X, Y: Double;
+    X, Y: Single;
   end;
   TSeries = array of TSeriesPt;
 
@@ -84,27 +84,27 @@ type
   TChartLabels = array of TChartLabel;
 
 { linear value->pixel mapping (both directions) }
-function AxPix(const m: TAxisMap; v: Double): Double; inline;
-function AxVal(const m: TAxisMap; px: Double): Double; inline;
+function AxPix(const m: TAxisMap; v: Single): Single; inline;
+function AxVal(const m: TAxisMap; px: Single): Single; inline;
 
 { horizontal gridlines at the given Y values, spanning [x0..x1] }
-procedure PlotGridH(const p: TPlot; const yvals: array of Double;
+procedure PlotGridH(const p: TPlot; const yvals: array of Single;
   const ay: TAxisMap; x0, x1: integer; const g: TGridStyle);
 
 { vertical gridlines at the given X values, spanning [y0..y1] }
-procedure PlotGridV(const p: TPlot; const xvals: array of Double;
+procedure PlotGridV(const p: TPlot; const xvals: array of Single;
   const ax: TAxisMap; y0, y1: integer; const g: TGridStyle);
 
 { closed-to-baseline fill + width-2 stroke of a function-style series
   (x monotone in value space); the fill runs per column from the
   interpolated curve down to the baseline pixel }
 procedure PlotSeriesFillBaseline(const p: TPlot; const s: TSeries;
-  const ax, ay: TAxisMap; baselineVal: Double;
+  const ax, ay: TAxisMap; baselineVal: Single;
   const fill: TFillStyle; const stroke: TStrokeStyle);
 
 { same, but only pixel columns in [clipX0..clipX1] (single-channel patch) }
 procedure PlotSeriesFillBaselineClip(const p: TPlot; const s: TSeries;
-  const ax, ay: TAxisMap; baselineVal: Double;
+  const ax, ay: TAxisMap; baselineVal: Single;
   const fill: TFillStyle; const stroke: TStrokeStyle;
   clipX0, clipX1: integer);
 
@@ -113,7 +113,7 @@ procedure PlotSeriesLine(const p: TPlot; const s: TSeries;
   const ax, ay: TAxisMap; const st: TStrokeStyle);
 
 { vertical dashed reference line at value xv (the focused-channel mark) }
-procedure PlotRefLineV(const p: TPlot; xv: Double; const ax: TAxisMap;
+procedure PlotRefLineV(const p: TPlot; xv: Single; const ax: TAxisMap;
   y0, y1: integer; const d: TDashSpec);
 
 procedure AddLabel(var labels: TChartLabels; x, y: integer;
@@ -121,7 +121,7 @@ procedure AddLabel(var labels: TChartLabels; x, y: integer;
 
 implementation
 
-function AxPix(const m: TAxisMap; v: Double): Double; inline;
+function AxPix(const m: TAxisMap; v: Single): Single; inline;
 begin
   if m.Val1 = m.Val0 then
     Result := m.Pix0
@@ -129,7 +129,7 @@ begin
     Result := m.Pix0 + (v - m.Val0) / (m.Val1 - m.Val0) * (m.Pix1 - m.Pix0);
 end;
 
-function AxVal(const m: TAxisMap; px: Double): Double; inline;
+function AxVal(const m: TAxisMap; px: Single): Single; inline;
 begin
   if m.Pix1 = m.Pix0 then
     Result := m.Val0
@@ -150,7 +150,7 @@ begin
   labels[n].rgb := rgb;
 end;
 
-procedure PlotGridH(const p: TPlot; const yvals: array of Double;
+procedure PlotGridH(const p: TPlot; const yvals: array of Single;
   const ay: TAxisMap; x0, x1: integer; const g: TGridStyle);
 var
   i: integer;
@@ -160,7 +160,7 @@ begin
       g.WidthPx, g.Color, g.Alpha);
 end;
 
-procedure PlotGridV(const p: TPlot; const xvals: array of Double;
+procedure PlotGridV(const p: TPlot; const xvals: array of Single;
   const ax: TAxisMap; y0, y1: integer; const g: TGridStyle);
 var
   i: integer;
@@ -177,12 +177,12 @@ end;
   from there down to the baseline. Stroke = the 2 px vertical pair per
   column (cairo's butt-capped width-2 stroke on a shallow curve). }
 procedure PlotSeriesFillBaselineClip(const p: TPlot; const s: TSeries;
-  const ax, ay: TAxisMap; baselineVal: Double;
+  const ax, ay: TAxisMap; baselineVal: Single;
   const fill: TFillStyle; const stroke: TStrokeStyle;
   clipX0, clipX1: integer);
 var
   i, xi, x0, x1, ry, base_i: integer;
-  frac: Double;
+  frac: Single;
 begin
   if Length(s) < 2 then
     exit;
@@ -214,7 +214,7 @@ begin
 end;
 
 procedure PlotSeriesFillBaseline(const p: TPlot; const s: TSeries;
-  const ax, ay: TAxisMap; baselineVal: Double;
+  const ax, ay: TAxisMap; baselineVal: Single;
   const fill: TFillStyle; const stroke: TStrokeStyle);
 var
   x0, x1: integer;
@@ -245,7 +245,7 @@ begin
   end;
 end;
 
-procedure PlotRefLineV(const p: TPlot; xv: Double; const ax: TAxisMap;
+procedure PlotRefLineV(const p: TPlot; xv: Single; const ax: TAxisMap;
   y0, y1: integer; const d: TDashSpec);
 begin
   PlotDashedVLine(p, PlotRound(AxPix(ax, xv)), y0, y1, d.WidthPx,
