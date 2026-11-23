@@ -57,6 +57,9 @@ type
 { create the mutex; call once before any task touches the store }
 procedure APStoreInit;
 
+{ clear all AP entries and history samples, bumping revision }
+procedure APStoreClear;
+
 { record one scan result (fields read from a C wifi_ap_record_t blob by
   the caller, which owns the offsets); now_ms from esp_timer }
 procedure APStoreAdd(const bssid: TBssid;
@@ -106,6 +109,22 @@ begin
   entry_count := 0;
   FillChar(color_used, SizeOf(color_used), 0);
   revision := 0;
+end;
+
+procedure APStoreClear;
+var
+  i: integer;
+begin
+  xSemaphoreTake(mutex, $FFFFFFFF);
+  try
+    for i := 0 to entry_count - 1 do
+      entries[i] := Default(TAPEntry);
+    entry_count := 0;
+    FillChar(color_used, SizeOf(color_used), 0);
+    Inc(revision);
+  finally
+    xSemaphoreGive(mutex);
+  end;
 end;
 
 procedure APStoreAdd(const bssid: TBssid;

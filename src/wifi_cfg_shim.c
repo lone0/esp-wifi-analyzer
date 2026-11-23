@@ -131,6 +131,25 @@ void wa_ui_wait_idle(int timeout_ms)
     }
 }
 
+static void wa_wait_disp_flush_done(lv_display_t *disp)
+{
+    if (disp == NULL || !disp->flushing) {
+        return;
+    }
+    int64_t t0 = esp_timer_get_time();
+    while (disp->flushing) {
+        int64_t elapsed_us = esp_timer_get_time() - t0;
+        if (elapsed_us < 1500) {
+            taskYIELD();
+        } else if (elapsed_us < 50000) {
+            vTaskDelay(1);
+        } else {
+            ESP_LOGW("wa-ui", "flush wait timeout (>50 ms)");
+            break;
+        }
+    }
+}
+
 /* --- LVGL & LCD DMA Timing Profiler --- */
 static int64_t s_prof_refr_start_us;
 static int64_t s_prof_render_start_us;
@@ -194,8 +213,7 @@ static void wa_prof_disp_cb(lv_event_t *e)
     case LV_EVENT_RENDER_READY: {
         int64_t render_ready_us = now;
         int64_t dma_tail_start = esp_timer_get_time();
-        while (disp && disp->flushing) {
-        }
+        wa_wait_disp_flush_done(disp);
         int64_t dma_done_us = esp_timer_get_time();
         int64_t last_dma_us = dma_done_us - s_prof_flush_start_us;
         int64_t tail_after_render_ready_us = dma_done_us - dma_tail_start;
@@ -221,8 +239,7 @@ static void wa_prof_disp_cb(lv_event_t *e)
         break;
     }
     case LV_EVENT_REFR_READY:
-        while (disp && disp->flushing) {
-        }
+        wa_wait_disp_flush_done(disp);
         wa_ui_bus_release_if_idle(disp);
         break;
     default:
@@ -240,6 +257,186 @@ static void wa_co5300_rounder_cb(lv_area_t *area, void *user_data)
     area->y2 |= 1;
 }
 
+/* --- Canvas Gesture Recognizer (Swipes, Continuous Drag, Double Tap) --- */
+enum {
+    WA_GESTURE_NONE        = 0,
+    WA_GESTURE_SWIPE_LEFT  = 1,
+    WA_GESTURE_SWIPE_RIGHT = 2,
+    WA_GESTURE_SWIPE_UP    = 3,
+    WA_GESTURE_SWIPE_DOWN  = 4,
+    WA_GESTURE_DRAG_BEGIN  = 5,
+    WA_GESTURE_DRAG_MOVE   = 6,
+    WA_GESTURE_DRAG_END    = 7,
+    WA_GESTURE_DOUBLE_TAP  = 8,
+};
+
+#define WA_EDGE_X_MARGIN_PX    100
+#define WA_SWIPE_MIN_DIST_PX    42
+#define WA_DRAG_MIN_DIST_PX     10
+#define WA_DRAG_STEP_MIN_PX      4
+#define WA_TAP_MAX_DIST_PX      16
+#define WA_TAP_MAX_TIME_MS     280
+#define WA_DBLTAP_MAX_TIME_MS  400
+#define WA_DBLTAP_MAX_DIST_PX   40
+
+typedef void (*wa_gesture_cb_t)(int32_t gtype, int32_t x, int32_t y, int32_t dx, int32_t dy);
+
+static lv_obj_t *s_gesture_obj;
+static wa_gesture_cb_t s_gesture_cb;
+static int32_t s_g_start_x, s_g_start_y;
+static int32_t s_g_last_x, s_g_last_y;
+static uint32_t s_g_press_ms;
+static bool s_g_was_pressed;
+static bool s_g_dragging;
+static bool s_g_swiped;
+static bool s_g_ignore;
+static bool s_g_edge_left;
+static bool s_g_edge_right;
+static int32_t s_g_active_view;
+static int32_t s_g_panel_open;
+static uint32_t s_g_last_tap_ms;
+static int32_t s_g_last_tap_x, s_g_last_tap_y;
+
+void wa_gesture_set_state(int32_t active_view, int32_t panel_open)
+{
+    s_g_active_view = active_view;
+    s_g_panel_open = panel_open;
+}
+
+static int32_t wa_iabs(int32_t v)
+{
+    return v < 0 ? -v : v;
+}
+
+static void wa_process_touch_gesture(bool pressed, const lv_point_t *pt)
+{
+    if (s_gesture_cb == NULL) {
+        return;
+    }
+
+    if (pressed && !s_g_was_pressed) {
+        s_g_was_pressed = true;
+        s_g_start_x = pt->x;
+        s_g_start_y = pt->y;
+        s_g_last_x = pt->x;
+        s_g_last_y = pt->y;
+        s_g_press_ms = lv_tick_get();
+        s_g_dragging = false;
+        s_g_swiped = false;
+        /* Ignore touches that start directly on the top-right CH/HIST buttons,
+         * or inside the open Quick Action panel (so its buttons can be clicked). */
+        s_g_ignore = (pt->y < 44 && pt->x >= 330) ||
+                     (s_g_panel_open != 0 && pt->y >= 44 && pt->y <= 182);
+        s_g_edge_left = (pt->x < WA_EDGE_X_MARGIN_PX) || (s_g_active_view != 0);
+        s_g_edge_right = (pt->x >= 480 - WA_EDGE_X_MARGIN_PX) || (s_g_active_view != 0);
+        return;
+    }
+
+    if (pressed && s_g_was_pressed) {
+        if (s_g_ignore || s_g_swiped) {
+            return;
+        }
+        int32_t dx = pt->x - s_g_start_x;
+        int32_t dy = pt->y - s_g_start_y;
+        int32_t adx = wa_iabs(dx);
+        int32_t ady = wa_iabs(dy);
+        s_g_last_x = pt->x;
+        s_g_last_y = pt->y;
+
+        /* 1) Left-edge swipe right -> switch view immediately */
+        if (!s_g_dragging && s_g_edge_left && dx >= WA_SWIPE_MIN_DIST_PX &&
+            adx * 10 >= ady * 12) {
+            s_g_swiped = true;
+            s_g_last_tap_ms = 0;
+            lv_indev_wait_release(wa_touch_indev);
+            s_gesture_cb(WA_GESTURE_SWIPE_RIGHT, pt->x, pt->y, dx, dy);
+            return;
+        }
+
+        /* 2) Right-edge swipe left -> switch view immediately */
+        if (!s_g_dragging && s_g_edge_right && dx <= -WA_SWIPE_MIN_DIST_PX &&
+            adx * 10 >= ady * 12) {
+            s_g_swiped = true;
+            s_g_last_tap_ms = 0;
+            lv_indev_wait_release(wa_touch_indev);
+            s_gesture_cb(WA_GESTURE_SWIPE_LEFT, pt->x, pt->y, dx, dy);
+            return;
+        }
+
+        /* 3) Top-to-bottom swipe -> open Quick Action pull-down panel */
+        if (!s_g_dragging && s_g_start_y < 180 && dy >= WA_SWIPE_MIN_DIST_PX &&
+            ady * 10 >= adx * 13) {
+            s_g_swiped = true;
+            s_g_last_tap_ms = 0;
+            lv_indev_wait_release(wa_touch_indev);
+            s_gesture_cb(WA_GESTURE_SWIPE_DOWN, pt->x, pt->y, dx, dy);
+            return;
+        }
+
+        /* 4) Bottom-to-top swipe -> close Quick Action pull-down panel */
+        if (!s_g_dragging && dy <= -WA_SWIPE_MIN_DIST_PX &&
+            ady * 10 >= adx * 13) {
+            s_g_swiped = true;
+            s_g_last_tap_ms = 0;
+            lv_indev_wait_release(wa_touch_indev);
+            s_gesture_cb(WA_GESTURE_SWIPE_UP, pt->x, pt->y, dx, dy);
+            return;
+        }
+
+        /* 5) Interior horizontal drag -> scroll channel view */
+        if (!s_g_edge_left && !s_g_edge_right && s_g_start_y >= 44) {
+            if (!s_g_dragging) {
+                if (adx >= WA_DRAG_MIN_DIST_PX && adx * 10 >= ady * 13) {
+                    s_g_dragging = true;
+                    s_g_last_tap_ms = 0;
+                    s_gesture_cb(WA_GESTURE_DRAG_BEGIN, s_g_start_x, s_g_start_y, 0, 0);
+                    s_gesture_cb(WA_GESTURE_DRAG_MOVE, pt->x, pt->y, dx, dy);
+                }
+            } else {
+                s_gesture_cb(WA_GESTURE_DRAG_MOVE, pt->x, pt->y, dx, dy);
+            }
+        }
+        return;
+    }
+
+    if (!pressed && s_g_was_pressed) {
+        s_g_was_pressed = false;
+        if (s_g_ignore || s_g_swiped) {
+            return;
+        }
+        int32_t dx = s_g_last_x - s_g_start_x;
+        int32_t dy = s_g_last_y - s_g_start_y;
+        int32_t adx = wa_iabs(dx);
+        int32_t ady = wa_iabs(dy);
+        uint32_t elapsed = lv_tick_elaps(s_g_press_ms);
+
+        if (s_g_dragging) {
+            s_g_dragging = false;
+            s_gesture_cb(WA_GESTURE_DRAG_END, s_g_last_x, s_g_last_y, dx, dy);
+            return;
+        }
+
+        /* Stationary tap on canvas -> check Double Tap */
+        if (s_g_start_y >= 44 && elapsed <= WA_TAP_MAX_TIME_MS &&
+            adx <= WA_TAP_MAX_DIST_PX && ady <= WA_TAP_MAX_DIST_PX) {
+            uint32_t now_ms = lv_tick_get();
+            if (s_g_last_tap_ms != 0 &&
+                lv_tick_elaps(s_g_last_tap_ms) <= WA_DBLTAP_MAX_TIME_MS &&
+                wa_iabs(s_g_last_x - s_g_last_tap_x) <= WA_DBLTAP_MAX_DIST_PX &&
+                wa_iabs(s_g_last_y - s_g_last_tap_y) <= WA_DBLTAP_MAX_DIST_PX) {
+                s_g_last_tap_ms = 0;
+                s_gesture_cb(WA_GESTURE_DOUBLE_TAP, s_g_last_x, s_g_last_y, 0, 0);
+            } else {
+                s_g_last_tap_ms = now_ms ? now_ms : 1;
+                s_g_last_tap_x = s_g_last_x;
+                s_g_last_tap_y = s_g_last_y;
+            }
+        } else {
+            s_g_last_tap_ms = 0;
+        }
+    }
+}
+
 static void wa_indev_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
@@ -252,9 +449,10 @@ static void wa_indev_event_cb(lv_event_t *e)
 static void wa_touch_tick(lv_timer_t *timer)
 {
     (void)timer;
-    if (lv_indev_get_state(wa_touch_indev) == LV_INDEV_STATE_PRESSED) {
+    lv_point_t p = {0, 0};
+    bool pressed = (lv_indev_get_state(wa_touch_indev) == LV_INDEV_STATE_PRESSED);
+    if (pressed) {
         wa_ui_bus_acquire();
-        lv_point_t p;
         lv_indev_get_point(wa_touch_indev, &p);
         lv_obj_set_pos(wa_touch_dot, p.x - 6, p.y - 6);
         lv_obj_set_hidden(wa_touch_dot, false);
@@ -265,6 +463,9 @@ static void wa_touch_tick(lv_timer_t *timer)
             lv_obj_set_hidden(wa_touch_dot, true);
             wa_touch_seen = false;
         }
+    }
+    wa_process_touch_gesture(pressed, &p);
+    if (!pressed) {
         wa_ui_bus_release_if_idle(NULL);
     }
 }
@@ -275,7 +476,8 @@ bool wa_touch_indicator_start(lv_indev_t *indev)
         return false;
     }
     wa_touch_indev = indev;
-    wa_touch_dot = lv_obj_create(lv_screen_active());
+    lv_obj_set_scrollable(lv_screen_active(), false);
+    wa_touch_dot = lv_obj_create(lv_layer_top());
     if (wa_touch_dot == NULL) {
         return false;
     }
@@ -302,6 +504,16 @@ bool wa_touch_indicator_start(lv_indev_t *indev)
         lv_display_add_event_cb(disp, wa_prof_disp_cb, LV_EVENT_ALL, NULL);
     }
     return true;
+}
+
+void wa_gesture_attach(lv_obj_t *target, wa_gesture_cb_t cb)
+{
+    if (target == NULL || cb == NULL) {
+        return;
+    }
+    s_gesture_obj = target;
+    s_gesture_cb = cb;
+    lv_obj_set_scrollable(target, false);
 }
 
 /* void* operator new[](unsigned int, std::nothrow_t const&) */
@@ -393,6 +605,18 @@ void wa_util_init(void)
     memset(s_permille, 0, sizeof(s_permille));
     memset(s_last_ms, 0, sizeof(s_last_ms));
     s_revision = 0;
+}
+
+void wa_util_clear(void)
+{
+    if (s_util_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_util_mutex, portMAX_DELAY);
+    memset(s_permille, 0, sizeof(s_permille));
+    memset(s_last_ms, 0, sizeof(s_last_ms));
+    ++s_revision;
+    xSemaphoreGive(s_util_mutex);
 }
 
 static void util_store_set(uint8_t ch, uint16_t permille, uint32_t now_ms)

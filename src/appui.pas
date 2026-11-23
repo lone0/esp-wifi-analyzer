@@ -58,6 +58,17 @@ const
   VIEW_COUNT = 2;
   VIEW_NAMES: array[0..VIEW_COUNT - 1] of PChar = ('CH', 'HIST');
 
+  { canvas gesture codes (matched with wa_gesture_obj_cb in wifi_cfg_shim.c) }
+  WA_GESTURE_NONE        = 0;
+  WA_GESTURE_SWIPE_LEFT  = 1;
+  WA_GESTURE_SWIPE_RIGHT = 2;
+  WA_GESTURE_SWIPE_UP    = 3;
+  WA_GESTURE_SWIPE_DOWN  = 4;
+  WA_GESTURE_DRAG_BEGIN  = 5;
+  WA_GESTURE_DRAG_MOVE   = 6;
+  WA_GESTURE_DRAG_END    = 7;
+  WA_GESTURE_DOUBLE_TAP  = 8;
+
 var
   { the chart canvas pixel buffer; the program allocates it (GetMem,
     PSRAM) before UIStart }
@@ -70,6 +81,7 @@ implementation
 
 type
   TlvTimerCb = procedure(timer: pointer); cdecl;
+  TWaGestureCb = procedure(gtype, x, y, dx, dy: cint32); cdecl;
   TlvArea = record
     x1, y1, x2, y2: cint32;
   end;
@@ -87,15 +99,24 @@ procedure lv_obj_set_style_pad_all(obj: plv_obj_t; value: cint32;
   selector: cuint); cdecl; external;
 function wa_touch_indicator_start(indev: pointer): cbool; cdecl; external;
 procedure wa_ui_bus_acquire; cdecl; external;
+procedure wa_gesture_attach(target: plv_obj_t; cb: TWaGestureCb); cdecl; external;
+procedure wa_gesture_set_state(active_view, panel_open: cint32); cdecl; external;
 
 var
   canvas_obj: plv_obj_t;
   bar: plv_obj_t;
   dot: plv_obj_t;
   ap_label: plv_obj_t;
+  quick_panel: plv_obj_t;
   view_btns: array[0..VIEW_COUNT - 1] of plv_obj_t;
+  quick_span_btns: array[0..2] of plv_obj_t;
   label_pool: array[0..N_LABELS - 1] of plv_obj_t;
   active_view: integer = 0;
+  active_span_mode: integer = 0;
+  quick_panel_open: boolean = false;
+  drag_start_v0: Single = CH_MIN;
+  drag_start_v1: Single = CH_MAX;
+  last_drawn_v0: Single = CH_MIN;
   repaint_pending: byte = 0;   { a view switch awaits a walk-free tick }
   drawn_revision: longword = 0;
   drawn_util_rev: longword = 0;
@@ -341,24 +362,14 @@ begin
 end;
 
 procedure SwitchView(v: integer); forward;
+procedure PerformViewSwitch(v: integer); forward;
 
 procedure ViewBtnCb(e: plv_event_t); cdecl;
 var
   v: integer;
 begin
   v := PtrInt(lv_event_get_user_data(e));
-  if (v >= 0) and (v < VIEW_COUNT) and (v <> active_view) then
-  begin
-    { Preempt any active channel dwell immediately and repaint now. }
-    wa_ui_bus_acquire;
-    SwitchView(v);
-    drawn_revision := APStoreRevision;
-    drawn_util_rev := scanner.UtilRevision;
-    repaint_pending := 0;
-    if Length(nets) = 0 then
-      RefreshSnapshot;
-    RepaintActive;
-  end;
+  PerformViewSwitch(v);
 end;
 
 procedure StyleViewBtn(btn: plv_obj_t; active: boolean);
@@ -388,8 +399,178 @@ var
   i: integer;
 begin
   active_view := v;
+  wa_gesture_set_state(active_view, Ord(quick_panel_open));
   for i := 0 to VIEW_COUNT - 1 do
     StyleViewBtn(view_btns[i], i = v);
+end;
+
+procedure PerformViewSwitch(v: integer);
+begin
+  if (v < 0) or (v >= VIEW_COUNT) or (v = active_view) then
+    exit;
+  wa_ui_bus_acquire;
+  SwitchView(v);
+  drawn_revision := APStoreRevision;
+  drawn_util_rev := scanner.UtilRevision;
+  repaint_pending := 0;
+  if Length(nets) = 0 then
+    RefreshSnapshot;
+  RepaintActive;
+end;
+
+procedure ShowQuickPanel(open: boolean);
+begin
+  if quick_panel = nil then
+    exit;
+  wa_ui_bus_acquire;
+  quick_panel_open := open;
+  wa_gesture_set_state(active_view, Ord(quick_panel_open));
+  if open then
+    lv_obj_remove_flag(quick_panel, LV_OBJ_FLAG_HIDDEN)
+  else
+    lv_obj_add_flag(quick_panel, LV_OBJ_FLAG_HIDDEN);
+end;
+
+procedure StyleQuickSpanBtns(mode: integer);
+var
+  i: integer;
+begin
+  active_span_mode := mode;
+  for i := 0 to 2 do
+    if quick_span_btns[i] <> nil then
+      StyleViewBtn(quick_span_btns[i], i = mode);
+end;
+
+procedure ApplySpanPreset(mode: integer);
+begin
+  StyleQuickSpanBtns(mode);
+  case mode of
+    0: SetChViewport(1.0, 13.0, -1.0, 15.0);
+    1: SetChViewport(1.0, 7.0, 0.5, 13.5);
+    2: SetChViewport(36.0, 68.0, 32.0, 169.0);
+  end;
+  last_drawn_v0 := ChViewStart;
+  if active_view <> 0 then
+    SwitchView(0);
+  if Length(nets) = 0 then
+    RefreshSnapshot;
+  RepaintActive;
+end;
+
+procedure ClearHistoryAndRescan;
+begin
+  wa_ui_bus_acquire;
+  scanner.ScannerRequestRescan;
+  SetLength(snap, 0);
+  SetLength(nets, 0);
+  last_ap_count := 0;
+  lv_label_set_text(ap_label, 'AP: 0');
+  drawn_revision := APStoreRevision;
+  drawn_util_rev := scanner.UtilRevision;
+  repaint_pending := 0;
+  RepaintActive;
+end;
+
+procedure QuickActionCb(e: plv_event_t); cdecl;
+var
+  act: integer;
+begin
+  act := PtrInt(lv_event_get_user_data(e));
+  case act of
+    0, 1, 2:
+    begin
+      ShowQuickPanel(false);
+      ApplySpanPreset(act);
+    end;
+    3:
+    begin
+      ShowQuickPanel(false);
+      ClearHistoryAndRescan;
+    end;
+    4:
+    begin
+      ShowQuickPanel(false);
+      PerformViewSwitch(1 - active_view);
+    end;
+    5:
+      ShowQuickPanel(false);
+  end;
+end;
+
+procedure OnCanvasGesture(gtype, x, y, dx, dy: cint32); cdecl;
+var
+  plot_w: integer;
+  span, dval: Single;
+begin
+  case gtype of
+    WA_GESTURE_SWIPE_DOWN:
+    begin
+      writeln('GESTURE: SWIPE_DOWN -> Quick Action Panel open');
+      ShowQuickPanel(true);
+    end;
+    WA_GESTURE_SWIPE_UP:
+    begin
+      if quick_panel_open then
+      begin
+        writeln('GESTURE: SWIPE_UP -> Quick Action Panel close');
+        ShowQuickPanel(false);
+      end;
+    end;
+    WA_GESTURE_SWIPE_LEFT, WA_GESTURE_SWIPE_RIGHT:
+    begin
+      if quick_panel_open then
+        ShowQuickPanel(false);
+      writeln('GESTURE: EDGE_SWIPE dir=', gtype, ' -> switch view to ', 1 - active_view);
+      PerformViewSwitch(1 - active_view);
+    end;
+    WA_GESTURE_DRAG_BEGIN:
+    begin
+      if (active_view = 0) and (not quick_panel_open) then
+      begin
+        drag_start_v0 := ChViewStart;
+        drag_start_v1 := ChViewEnd;
+        last_drawn_v0 := ChViewStart;
+        writeln('GESTURE: DRAG_BEGIN ch_view=[', Round(drag_start_v0), '..', Round(drag_start_v1), ']');
+      end;
+    end;
+    WA_GESTURE_DRAG_MOVE:
+    begin
+      if (active_view = 0) and (not quick_panel_open) then
+      begin
+        plot_w := CANVAS_W - CH_ML - CH_MR;
+        span := drag_start_v1 - drag_start_v0;
+        dval := -dx * span / plot_w;
+        SetChViewport(drag_start_v0 + dval, drag_start_v1 + dval, ChScrollMin, ChScrollMax);
+        if Abs(ChViewStart - last_drawn_v0) >= 0.15 then
+        begin
+          last_drawn_v0 := ChViewStart;
+          RepaintActive;
+        end;
+      end;
+    end;
+    WA_GESTURE_DRAG_END:
+    begin
+      if (active_view = 0) and (not quick_panel_open) then
+      begin
+        if Abs(ChViewStart - last_drawn_v0) >= 0.01 then
+        begin
+          last_drawn_v0 := ChViewStart;
+          RepaintActive;
+        end;
+        writeln('GESTURE: DRAG_END ch_view=[', Round(ChViewStart), '..', Round(ChViewEnd), ']');
+      end;
+    end;
+    WA_GESTURE_DOUBLE_TAP:
+    begin
+      if quick_panel_open then
+        ShowQuickPanel(false)
+      else
+      begin
+        writeln('GESTURE: DOUBLE_TAP -> Clear history and rescan');
+        ClearHistoryAndRescan;
+      end;
+    end;
+  end;
 end;
 
 procedure UIStart;
@@ -471,9 +652,61 @@ begin
     lv_obj_add_flag(label_pool[i], LV_OBJ_FLAG_HIDDEN);
   end;
 
+  { ---- pull-down quick action panel (hidden until top-down swipe) ---- }
+  quick_panel := lv_obj_create(lv_screen_active);
+  lv_obj_set_pos(quick_panel, 12, 44);
+  lv_obj_set_size(quick_panel, SCREEN_W - 24, 134);
+  lv_obj_set_style_bg_color(quick_panel, ColorMake($1E, $22, $2A), LV_STYLE_MAIN);
+  lv_obj_set_style_border_width(quick_panel, 2, LV_STYLE_MAIN);
+  lv_obj_set_style_pad_all(quick_panel, 8, LV_STYLE_MAIN);
+  lv_obj_remove_flag(quick_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(quick_panel, LV_OBJ_FLAG_HIDDEN);
+
+  title := lv_label_create(quick_panel);
+  lv_label_set_text(title, 'Quick Actions  (Swipe Up / Close)');
+  lv_obj_set_style_text_color(title, ColorMake($FF, $FF, $FF), LV_STYLE_MAIN);
+  lv_obj_set_pos(title, 8, 2);
+
+  for i := 0 to 2 do
+  begin
+    quick_span_btns[i] := lv_button_create(quick_panel);
+    lv_obj_set_pos(quick_span_btns[i], 6 + i * 144, 30);
+    lv_obj_set_size(quick_span_btns[i], 136, 36);
+    lv_obj_set_style_pad_all(quick_span_btns[i], 0, LV_STYLE_MAIN);
+    lv_obj_add_event_cb(quick_span_btns[i], @QuickActionCb, LV_EVENT_CLICKED,
+      pointer(PtrInt(i)));
+    btn_lbl := lv_label_create(quick_span_btns[i]);
+    case i of
+      0: lv_label_set_text(btn_lbl, '2.4G (1-13)');
+      1: lv_label_set_text(btn_lbl, '2.4G Zoom');
+      2: lv_label_set_text(btn_lbl, '5G (36-165)');
+    end;
+    lv_obj_center(btn_lbl);
+  end;
+  StyleQuickSpanBtns(0);
+
+  for i := 3 to 5 do
+  begin
+    btn_lbl := lv_button_create(quick_panel);
+    lv_obj_set_pos(btn_lbl, 6 + (i - 3) * 144, 76);
+    lv_obj_set_size(btn_lbl, 136, 36);
+    lv_obj_set_style_pad_all(btn_lbl, 0, LV_STYLE_MAIN);
+    lv_obj_add_event_cb(btn_lbl, @QuickActionCb, LV_EVENT_CLICKED,
+      pointer(PtrInt(i)));
+    title := lv_label_create(btn_lbl);
+    case i of
+      3: lv_label_set_text(title, 'Clear & Scan');
+      4: lv_label_set_text(title, 'Toggle View');
+      5: lv_label_set_text(title, 'Close Menu');
+    end;
+    lv_obj_center(title);
+    StyleViewBtn(btn_lbl, i = 3);
+  end;
+
   { ---- first paint + the revision-gated tick ---- }
   if not wa_touch_indicator_start(TBoardLvgl.Touch) then
     writeln('WA: W touch indicator unavailable');
+  wa_gesture_attach(canvas_obj, @OnCanvasGesture);
   SwitchView(0);
   RefreshSnapshot;
   RepaintActive;

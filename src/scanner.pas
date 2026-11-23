@@ -28,10 +28,13 @@ var
   UtilPatchCh: integer = 0;
   { 1: UI must full-repaint (AP curves) at next walk-free tick }
   UtilNeedFullPaint: byte = 0;
+  { 1: user requested history clear + immediate full scan }
+  ForceRescan: byte = 0;
 
 function ScannerInit: boolean;
 procedure ScannerPrepare;
 procedure ScannerStart;
+procedure ScannerRequestRescan;
 
 { per-channel occupancy, per-mille 0..1000; -1 = expired/never probed }
 function ChannelUtilPM(ch: integer): integer;
@@ -62,12 +65,21 @@ var
   run_enabled: byte = 0;
 
 procedure wa_util_init; cdecl; external;
+procedure wa_util_clear; cdecl; external;
 procedure wa_util_sweep_begin; cdecl; external;
 function wa_util_dwell_channel(ch: cint): cint; cdecl; external;
 procedure wa_util_sweep_end; cdecl; external;
 function wa_util_channel_pm(ch: cint): cint; cdecl; external;
 function wa_util_revision: longword; cdecl; external;
 procedure wa_ui_wait_idle(timeout_ms: cint); cdecl; external;
+
+procedure ScannerRequestRescan;
+begin
+  APStoreClear;
+  wa_util_clear;
+  UtilPatchCh := 0;
+  ForceRescan := 1;
+end;
 
 function ChannelUtilPM(ch: integer): integer;
 begin
@@ -158,7 +170,7 @@ end;
 function ScanTaskFT(arg: pointer): ptrint;
 var
   cycle: integer = 0;
-  ch, dwell_res: integer;
+  ch, dwell_res, gap_waited: integer;
 begin
   Result := 0;
   writeln(TAGmsg, ': I worker up (16 KB, fthreads/TLS slot 1)');
@@ -169,25 +181,32 @@ begin
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
     end;
+    ForceRescan := 0;
     ScannerBusy := 1;
 
     ScanAPs;
+    if ForceRescan <> 0 then
+      continue;
 
     { Wait until the UI tick has drawn AP curves before util patches. }
     UtilNeedFullPaint := 1;
     WaitUiPainted(1500);
     if UtilNeedFullPaint <> 0 then
       writeln(TAGmsg, ': W UI paint ack timeout after scan');
+    if ForceRescan <> 0 then
+      continue;
 
     { Per channel: abortable dwell → UI patches that strip → next. }
     UtilDeferPaint := 1;
     wa_util_sweep_begin;
     ch := 1;
-    while ch <= 13 do
+    while (ch <= 13) and (ForceRescan = 0) do
     begin
       WalkActive := 1;
       dwell_res := wa_util_dwell_channel(ch);
       WalkActive := 0;
+      if ForceRescan <> 0 then
+        break;
       if dwell_res > 0 then
       begin
         UtilPatchCh := ch;   { tick patches this strip, then clears }
@@ -205,13 +224,21 @@ begin
     UtilPatchCh := 0;
     wa_util_sweep_end;
     UtilDeferPaint := 0;
+    if ForceRescan <> 0 then
+      continue;
+
     UtilNeedFullPaint := 1;  { reconcile util + AP curves after the sweep }
     WaitUiPainted(1500);
     writeln(TAGmsg, ': I util sweep done');
 
     ScannerBusy := 0;
     Inc(cycle);
-    vTaskDelay(pdMS_TO_TICKS(SCAN_GAP_MS));
+    gap_waited := 0;
+    while (gap_waited < SCAN_GAP_MS) and (ForceRescan = 0) do
+    begin
+      vTaskDelay(pdMS_TO_TICKS(20));
+      Inc(gap_waited, 20);
+    end;
   until false;
 end;
 

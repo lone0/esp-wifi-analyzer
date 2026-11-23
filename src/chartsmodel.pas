@@ -112,8 +112,17 @@ const
   { the 9th, shared: every uncolored AP renders with this }
   PALETTE_OTHER: LongWord = $8C8C8C;   { neutral gray for the uncolored }
 
-{ channel-axis map: channels 1..13 across the plot width }
+{ channel-axis map: current visible channel window across the plot width }
 function ChAxis(plot_w: integer): TAxisMap;
+procedure SetChViewport(v0, v1, min_limit, max_limit: Single);
+procedure ScrollChViewportByPixels(dx_px, plot_w: integer);
+procedure ResetChViewport;
+
+var
+  ChViewStart: Single = CH_MIN;
+  ChViewEnd: Single = CH_MAX;
+  ChScrollMin: Single = -1.0;
+  ChScrollMax: Single = 15.0;
 { dBm-axis map: DBM_MIN at the plot bottom, DBM_MAX at the top }
 function DbmAxis(plot_h: integer): TAxisMap;
 
@@ -161,8 +170,48 @@ function ChAxis(plot_w: integer): TAxisMap;
 begin
   Result.Pix0 := CH_ML;
   Result.Pix1 := CH_ML + plot_w;
-  Result.Val0 := CH_MIN;
-  Result.Val1 := CH_MAX;
+  Result.Val0 := ChViewStart;
+  Result.Val1 := ChViewEnd;
+end;
+
+procedure SetChViewport(v0, v1, min_limit, max_limit: Single);
+var
+  span: Single;
+begin
+  span := v1 - v0;
+  if span < 4.0 then
+    span := 4.0;
+  ChScrollMin := min_limit;
+  ChScrollMax := max_limit;
+  if v0 < ChScrollMin then
+  begin
+    v0 := ChScrollMin;
+    v1 := v0 + span;
+  end;
+  if v1 > ChScrollMax then
+  begin
+    v1 := ChScrollMax;
+    v0 := v1 - span;
+  end;
+  ChViewStart := v0;
+  ChViewEnd := v1;
+end;
+
+procedure ScrollChViewportByPixels(dx_px, plot_w: integer);
+var
+  span, dval: Single;
+begin
+  if plot_w <= 0 then
+    exit;
+  span := ChViewEnd - ChViewStart;
+  { Dragging finger right (dx_px > 0) pans the viewport toward lower channels }
+  dval := -dx_px * span / plot_w;
+  SetChViewport(ChViewStart + dval, ChViewEnd + dval, ChScrollMin, ChScrollMax);
+end;
+
+procedure ResetChViewport;
+begin
+  SetChViewport(CH_MIN, CH_MAX, -1.0, 15.0);
 end;
 
 function DbmAxis(plot_h: integer): TAxisMap;
@@ -231,13 +280,34 @@ begin
     AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
       IntToStr(DBM_MIN + i * 10), DIM_HEX);
 
-  { vertical channel gridlines + tick labels }
-  for i := 0 to 12 do
-    grid_v[i] := CH_MIN + i;
-  PlotGridV(p, grid_v, ax, CH_MT, CH_MT + plot_h, gst);
-  for i := 0 to 12 do
-    AddLabel(labels, PlotRound(AxPix(ax, grid_v[i])) - 5,
-      p.H - CH_MB + 15, IntToStr(CH_MIN + i), DIM_HEX);
+  { vertical channel gridlines + tick labels (clipped to [CH_ML..CH_ML+plot_w]) }
+  if ChViewEnd <= 20 then
+  begin
+    for i := 1 to 14 do
+    begin
+      tx := PlotRound(AxPix(ax, i));
+      if (tx >= CH_ML) and (tx <= CH_ML + plot_w) then
+      begin
+        PlotFillRect(p, tx, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
+        AddLabel(labels, tx - 5, p.H - CH_MB + 15, IntToStr(i), DIM_HEX);
+      end;
+    end;
+  end
+  else
+  begin
+    { 5 GHz channel ticks (36..165 step 8 so labels do not overlap) }
+    i := 36;
+    while i <= 165 do
+    begin
+      tx := PlotRound(AxPix(ax, i));
+      if (tx >= CH_ML) and (tx <= CH_ML + plot_w) then
+      begin
+        PlotFillRect(p, tx, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
+        AddLabel(labels, tx - 8, p.H - CH_MB + 15, IntToStr(i), DIM_HEX);
+      end;
+      Inc(i, 8);
+    end;
+  end;
 
   if Length(nets) = 0 then
   begin
@@ -268,7 +338,7 @@ begin
     sst.Color := color;
     sst.Alpha := STROKE_A;
     sst.WidthPx := 2;
-    PlotSeriesFillBaseline(p, s, ax, ay, DBM_MIN, fst, sst);
+    PlotSeriesFillBaselineClip(p, s, ax, ay, DBM_MIN, fst, sst, CH_ML, CH_ML + plot_w);
   end;
 
   { SSID labels, strongest 10 (C MAX_LABELS), 16-char truncation.
@@ -280,15 +350,20 @@ begin
   np := 0;
   for i := 0 to High(nets) do
   begin
-    if i >= 10 then
+    if np >= 10 then
       break;
+    tx := PlotRound(AxPix(ax, nets[i].channel));
+    if (tx < CH_ML) or (tx > CH_ML + plot_w) then
+      continue;
+    tx := tx + 2;
     label_s := Copy(nets[i].ssid, 1, 16);
     if label_s = '' then
       label_s := '(hidden)';
-    tx := PlotRound(AxPix(ax, nets[i].channel)) + 2;
     tw := Length(label_s) * 9 + 4;
     if tx + tw > p.W - 4 then
       tx := p.W - 4 - tw;
+    if tx < CH_ML then
+      tx := CH_ML;
     ty := PlotRound(AxPix(ay, nets[i].dbm)) - 10;
     { greedy descent: step down until the rectangle is free }
     for tries := 1 to 25 do
@@ -377,7 +452,9 @@ begin
     PlotFillRect(p, x0, gy, x1 - x0 + 1, 1, gst.Color, gst.Alpha);
   end;
   { vertical channel line }
-  PlotFillRect(p, PlotRound(AxPix(ax, ch)), CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
+  gy := PlotRound(AxPix(ax, ch));
+  if (gy >= x0) and (gy <= x1) then
+    PlotFillRect(p, gy, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
 
   { restore bell pixels that fall in this strip }
   for i := High(nets) downto 0 do
