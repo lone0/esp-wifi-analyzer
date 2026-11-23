@@ -98,6 +98,8 @@ var
   repaint_pending: byte = 0;   { a view switch awaits a walk-free tick }
   drawn_revision: longword = 0;
   drawn_util_rev: longword = 0;
+  last_ap_count: longint = -1;
+  last_scan_busy: shortint = -1;
   snap: TAPEntries;
   nets: array of TNet;
 
@@ -257,14 +259,22 @@ begin
   util_rev := scanner.UtilRevision;
   count := APStoreCount;
 
-  status_buf := 'AP: ' + IntToStr(count);
-  lv_label_set_text(ap_label, PChar(status_buf));
-  if ScannerBusy <> 0 then
-    lv_obj_set_style_bg_color(dot, ColorMake((SCAN_ON shr 16) and $FF,
-      (SCAN_ON shr 8) and $FF, SCAN_ON and $FF), LV_STYLE_MAIN)
-  else
-    lv_obj_set_style_bg_color(dot, ColorMake((SCAN_OFF shr 16) and $FF,
-      (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
+  if longint(count) <> last_ap_count then
+  begin
+    last_ap_count := longint(count);
+    status_buf := 'AP: ' + IntToStr(count);
+    lv_label_set_text(ap_label, PChar(status_buf));
+  end;
+  if shortint(ScannerBusy) <> last_scan_busy then
+  begin
+    last_scan_busy := shortint(ScannerBusy);
+    if ScannerBusy <> 0 then
+      lv_obj_set_style_bg_color(dot, ColorMake((SCAN_ON shr 16) and $FF,
+        (SCAN_ON shr 8) and $FF, SCAN_ON and $FF), LV_STYLE_MAIN)
+    else
+      lv_obj_set_style_bg_color(dot, ColorMake((SCAN_OFF shr 16) and $FF,
+        (SCAN_OFF shr 8) and $FF, SCAN_OFF and $FF), LV_STYLE_MAIN);
+  end;
 
   if scanner.WalkActive <> 0 then
   begin

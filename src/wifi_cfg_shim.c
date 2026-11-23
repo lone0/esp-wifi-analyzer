@@ -142,7 +142,7 @@ static void wa_prof_disp_cb(lv_event_t *e)
         int64_t render_total_us = render_ready_us - s_prof_render_start_us;
         int64_t sw_draw_only_us = render_total_us - s_prof_wait_sum_us - s_prof_flush_call_sum_us;
 
-        if (s_prof_total_px > 2000 || s_prof_y2 > 100) {
+        if (s_prof_total_px > 0) {
             printf("PROF-FRAME: area=(%ld,%ld..%ld,%ld) px=%lu flushes=%lu | "
                    "layout=%lld us | render_start->ready=%lld us (sw_draw=%lld us, dma_wait=%lld us, flush_cb=%lld us) | "
                    "last_dma_tx=%lld us (tail_after_ready=%lld us) | total_refr_to_dma_done=%lld us\n",
