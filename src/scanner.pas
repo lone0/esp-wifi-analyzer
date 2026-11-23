@@ -153,6 +153,8 @@ begin
     now_ms := longword(esp_timer_get_time div 1000);
     for i := 0 to num - 1 do
     begin
+      if RecRssi(PApRecordBytes(recs) + i) < -80 then
+        continue;
       RecBssid(PApRecordBytes(recs) + i, bssid);
       APStoreAdd(bssid, RecSsid(PApRecordBytes(recs) + i),
         RecPrimary(PApRecordBytes(recs) + i),

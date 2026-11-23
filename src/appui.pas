@@ -158,42 +158,48 @@ end;
 
 procedure RefreshSnapshot;
 var
-  i: integer;
+  i, n, rssi: integer;
 begin
   APStoreCopySorted(snap);
   SetLength(nets, Length(snap));
+  n := 0;
   for i := 0 to Length(snap) - 1 do
   begin
-    nets[i].ssid := snap[i].ssid;
-    nets[i].channel := snap[i].channel;
-    nets[i].width_mhz := 20;   { TODO: map wifi_bandwidth_t per AP }
-    nets[i].dbm := APLatestRssi(snap[i]);
+    rssi := APLatestRssi(snap[i]);
+    if rssi < chartsmodel.DBM_MIN then
+      continue;
+    nets[n].ssid := snap[i].ssid;
+    nets[n].channel := snap[i].channel;
+    nets[n].width_mhz := 20;   { TODO: map wifi_bandwidth_t per AP }
+    nets[n].dbm := rssi;
     if snap[i].color_idx <= High(chartsmodel.PALETTE) then
-      nets[i].color := chartsmodel.PALETTE[snap[i].color_idx]
+      nets[n].color := chartsmodel.PALETTE[snap[i].color_idx]
     else
-      nets[i].color := chartsmodel.PALETTE_OTHER;
+      nets[n].color := chartsmodel.PALETTE_OTHER;
+    Inc(n);
   end;
+  SetLength(nets, n);
 end;
 
-{ the strongest 6 APs' rings as C-style history lines (C history_view.c):
-  percent = (rssi+100)*100/55 clamped; color = the AP's palette slot or
-  the shared gray; name = 8-char SSID or '(hidden)' }
+{ Colored APs' rings as history lines in dBm (-80..-20, aligned with CH view);
+  uncolored (gray) APs and APs weaker than -80 dBm are excluded. }
 procedure BuildHistLines(out lines: THistLines);
 var
-  i, k, n, pct: integer;
+  i, k, n, dbm: integer;
 begin
   SetLength(lines, 0);
   for i := 0 to Length(snap) - 1 do
   begin
     if Length(lines) >= 6 then
       break;
+    if snap[i].color_idx > High(chartsmodel.PALETTE) then
+      continue;
+    if APLatestRssi(snap[i]) < chartsmodel.DBM_MIN then
+      continue;
     if snap[i].hist_count < 2 then
       continue;
     SetLength(lines, Length(lines) + 1);
-    if snap[i].color_idx <= High(chartsmodel.PALETTE) then
-      lines[High(lines)].color := chartsmodel.PALETTE[snap[i].color_idx]
-    else
-      lines[High(lines)].color := chartsmodel.PALETTE_OTHER;
+    lines[High(lines)].color := chartsmodel.PALETTE[snap[i].color_idx];
     if snap[i].ssid <> '' then
       lines[High(lines)].name := Copy(snap[i].ssid, 1, 8)
     else
@@ -202,13 +208,12 @@ begin
     SetLength(lines[High(lines)].pts, n);
     for k := 0 to n - 1 do
     begin
-      pct := (snap[i].rssi_hist[(snap[i].hist_head + k) mod AP_HIST_LEN]
-        + 100) * 100 div 55;
-      if pct < 0 then
-        pct := 0;
-      if pct > 100 then
-        pct := 100;
-      lines[High(lines)].pts[k] := pct;
+      dbm := snap[i].rssi_hist[(snap[i].hist_head + k) mod AP_HIST_LEN];
+      if dbm < chartsmodel.DBM_MIN then
+        dbm := chartsmodel.DBM_MIN;
+      if dbm > chartsmodel.DBM_MAX then
+        dbm := chartsmodel.DBM_MAX;
+      lines[High(lines)].pts[k] := dbm;
     end;
   end;
 end;

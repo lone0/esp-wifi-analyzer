@@ -58,21 +58,21 @@ const
     0.15; our 1px line matches cairo's pixel values at alpha 38 }
   GRID_A   = 38;
 
-  { ChannelDrawingArea margins + axis ranges, verbatim }
+  { ChannelDrawingArea margins + axis ranges }
   CH_ML = 50;
   CH_MR = 20;
   CH_MT = 20;
   CH_MB = 40;
   CH_MIN = 1;
   CH_MAX = 13;
-  DBM_MIN = -100;
+  DBM_MIN = -80;
   DBM_MAX = -20;
 
-  { SignalHistoryDrawingArea margins, verbatim }
-  HI_ML = 42;
-  HI_MR = 18;
-  HI_MT = 18;
-  HI_MB = 30;
+  { SignalHistoryDrawingArea margins (aligned with CH view Y-axis) }
+  HI_ML = CH_ML;
+  HI_MR = CH_MR;
+  HI_MT = CH_MT;
+  HI_MB = CH_MB;
 
   { caps: MAX_CURVES 24 is ours (C caps at 12 for its ~280 ms vector
     rasterization; our raster path is far cheaper). The C label cap is
@@ -237,8 +237,7 @@ var
   collided: boolean;
   x0, x1: integer;
   placed: array[0..9] of record x0, y0, x1, y1: integer; end;
-  grid_h: array[0..8] of Single;    { -100..-20 step 10 }
-  grid_v: array[0..12] of Single;   { 1..13 }
+  grid_h: array[0..6] of Single;    { -80..-20 step 10 }
   gst: TGridStyle;
   fst: TFillStyle;
   sst: TStrokeStyle;
@@ -269,14 +268,14 @@ begin
       PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
   end;
 
-  { horizontal dBm gridlines + labels }
-  for i := 0 to 8 do
+  { horizontal dBm gridlines + labels (-80..-20 step 10) }
+  for i := 0 to 6 do
     grid_h[i] := DBM_MIN + i * 10;
   gst.Color := GRID_HEX;
   gst.Alpha := GRID_A;
   gst.WidthPx := 1;
   PlotGridH(p, grid_h, ay, CH_ML, CH_ML + plot_w, gst);
-  for i := 0 to 8 do
+  for i := 0 to 6 do
     AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
       IntToStr(DBM_MIN + i * 10), DIM_HEX);
 
@@ -320,6 +319,8 @@ begin
   begin
     if i >= MAX_CURVES then
       continue;
+    if nets[i].dbm < DBM_MIN then
+      continue;
     color := nets[i].color;
     center := nets[i].channel;
     bw := nets[i].width_mhz / 10;
@@ -352,6 +353,8 @@ begin
   begin
     if np >= 10 then
       break;
+    if nets[i].dbm < DBM_MIN then
+      continue;
     tx := PlotRound(AxPix(ax, nets[i].channel));
     if (tx < CH_ML) or (tx > CH_ML + plot_w) then
       continue;
@@ -442,11 +445,11 @@ begin
   { clear the 2 baseline stroke rows below plot_h so bell/grid alpha does not accumulate }
   PlotFillRect(p, x0, CH_MT + plot_h, x1 - x0 + 1, 2, 0, 255);
 
-  { horizontal grid segments across this strip }
+  { horizontal grid segments across this strip (-80..-20 step 10) }
   gst.Color := GRID_HEX;
   gst.Alpha := GRID_A;
   gst.WidthPx := 1;
-  for i := 0 to 8 do
+  for i := 0 to 6 do
   begin
     gy := PlotRound(AxPix(ay, DBM_MIN + i * 10));
     PlotFillRect(p, x0, gy, x1 - x0 + 1, 1, gst.Color, gst.Alpha);
@@ -460,6 +463,8 @@ begin
   for i := High(nets) downto 0 do
   begin
     if i >= MAX_CURVES then
+      continue;
+    if nets[i].dbm < DBM_MIN then
       continue;
     color := nets[i].color;
     center := nets[i].channel;
@@ -493,7 +498,7 @@ var
   s: TSeries;
   hst: TStrokeStyle;
   gst: TGridStyle;
-  grid_v: array[0..4] of Single;
+  grid_h: array[0..6] of Single;
 begin
   SetLength(labels, 0);
   PlotFillRect(p, 0, 0, p.W, p.H, BG_HEX, 255);
@@ -505,21 +510,18 @@ begin
   ax.Pix1 := HI_ML + plot_w;
   ax.Val0 := 0;
   ax.Val1 := HIST_WINDOW - 1;
-  ay.Pix0 := HI_MT + plot_h;
-  ay.Pix1 := HI_MT;
-  ay.Val0 := 0;
-  ay.Val1 := 100;
+  ay := DbmAxis(plot_h);
 
-  { percent gridlines + "N%" labels, 25% steps }
+  { dBm gridlines + labels (-80..-20 step 10), aligned with CH view }
   gst.Color := HGRID_HEX;
   gst.Alpha := HGRID_A;
-  gst.WidthPx := 2;
-  for i := 0 to 4 do
-    grid_v[i] := i * 25;
-  PlotGridH(p, grid_v, ay, HI_ML, HI_ML + plot_w, gst);
-  for i := 0 to 4 do
-    AddLabel(labels, 4, PlotRound(AxPix(ay, grid_v[i])) + 4,
-      IntToStr(i * 25) + '%', DIM_H_HEX);
+  gst.WidthPx := 1;
+  for i := 0 to 6 do
+    grid_h[i] := DBM_MIN + i * 10;
+  PlotGridH(p, grid_h, ay, HI_ML, HI_ML + plot_w, gst);
+  for i := 0 to 6 do
+    AddLabel(labels, 5, PlotRound(AxPix(ay, grid_h[i])) + 4,
+      IntToStr(DBM_MIN + i * 10), DIM_H_HEX);
 
   if Length(lines) = 0 then
   begin

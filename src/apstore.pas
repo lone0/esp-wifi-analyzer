@@ -275,6 +275,8 @@ begin
     begin
       if i >= n then
         break;
+      if APLatestRssi(entries[order[i]]) < -80 then
+        break;
       if entries[order[i]].color_idx = AP_COLOR_NONE then
       begin
         slot := -1;

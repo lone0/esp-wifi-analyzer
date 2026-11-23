@@ -327,8 +327,8 @@ static void wa_process_touch_gesture(bool pressed, const lv_point_t *pt)
          * or inside the open Quick Action panel (so its buttons can be clicked). */
         s_g_ignore = (pt->y < 44 && pt->x >= 330) ||
                      (s_g_panel_open != 0 && pt->y >= 44 && pt->y <= 182);
-        s_g_edge_left = (pt->x < WA_EDGE_X_MARGIN_PX) || (s_g_active_view != 0);
-        s_g_edge_right = (pt->x >= 480 - WA_EDGE_X_MARGIN_PX) || (s_g_active_view != 0);
+        s_g_edge_left = (pt->x < WA_EDGE_X_MARGIN_PX);
+        s_g_edge_right = (pt->x >= 480 - WA_EDGE_X_MARGIN_PX);
         return;
     }
 
