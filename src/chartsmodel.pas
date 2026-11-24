@@ -68,6 +68,22 @@ const
   DBM_MIN = -80;
   DBM_MAX = -20;
 
+  { Hardware-supported 5 GHz channels on Mosaico (ESP32-S31 esp_wifi_types_generic.h
+    wifi_5g_channel_bit_t, 36..165):
+      UNII-1 & UNII-2A: 36, 40, 44, 48, 52, 56, 60, 64  (cols 1..8)
+      [68..96 unsupported by hardware -> skipped]
+      UNII-2C (DFS):    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144 (cols 9..20)
+      [148 unsupported -> skipped]
+      UNII-3:           149, 153, 157, 161, 165 (cols 21..25)
+    Each column has the same width as 1 channel in 2.4 GHz view and
+    accommodates 4 channel numbers (e.g. col 1 = 36/37/38/39 displayed as 36). }
+  CH5G_COUNT = 25;
+  CH5G_CHANNELS: array[1..CH5G_COUNT] of integer = (
+    36, 40, 44, 48, 52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165
+  );
+
   { SignalHistoryDrawingArea margins (aligned with CH view Y-axis) }
   HI_ML = 42;
   HI_MR = 18;
@@ -90,6 +106,7 @@ type
     color: LongWord;   { resolved render color: palette slot or the
                          shared fallback }
   end;
+  TNetArray = array of TNet;
 
   { per-channel occupancy per-mille; fixed bounds avoid open-array High
     surprises at the unit boundary }
@@ -117,8 +134,12 @@ function ChAxis(plot_w: integer): TAxisMap;
 procedure SetChViewport(v0, v1, min_limit, max_limit: Single);
 procedure ScrollChViewportByPixels(dx_px, plot_w: integer);
 procedure ResetChViewport;
+procedure SetChBand5G(enable: boolean);
+function Ch5GToColPos(ch: integer): Single; inline;
+procedure BuildFake5GNets(out out_nets: TNetArray);
 
 var
+  ChBand5G: boolean = false;
   ChViewStart: Single = CH_MIN;
   ChViewEnd: Single = CH_MAX;
   ChScrollMin: Single = -1.0;
@@ -159,6 +180,7 @@ type
   blank). Percent = (rssi+100)*100/55 clamped, the C formula. }
 procedure DrawHistoryView(const p: TPlot; const lines: THistLines;
   out labels: TChartLabels);
+procedure BuildFake5GHistLines(out lines: THistLines);
 
 implementation
 
@@ -230,9 +252,100 @@ begin
   SetChViewport(ChViewStart + dval, ChViewEnd + dval, ChScrollMin, ChScrollMax);
 end;
 
+const
+  { Fixed fake per-channel occupancy (per-mille) for the 25 Mosaico-supported
+    5 GHz columns (36..64, 100..144, 149..165) }
+  FAKE_5G_UTIL_PM: array[1..CH5G_COUNT] of integer = (
+    185, 95, 240, 160, 70, 110, 45, 30,
+    140, 65, 90, 40, 210, 120, 55, 25, 80, 35, 15, 20,
+    310, 195, 260, 145, 85
+  );
+
 procedure ResetChViewport;
 begin
+  ChBand5G := false;
   SetChViewport(CH_MIN, CH_MAX, -1.0, 15.0);
+end;
+
+procedure SetChBand5G(enable: boolean);
+begin
+  ChBand5G := enable;
+  if enable then
+    { 13 columns visible per screen width (same column width as 2.4 GHz),
+      scrollable across all 25 hardware-supported 5 GHz columns (36..165) }
+    SetChViewport(1.0, 13.0, -1.0, CH5G_COUNT + 2.0)
+  else
+    SetChViewport(CH_MIN, CH_MAX, -1.0, 15.0);
+end;
+
+function Ch5GToColPos(ch: integer): Single; inline;
+begin
+  if (ch >= 36) and (ch <= 67) then
+    Result := 1.0 + (ch - 36) * 0.25
+  else if (ch >= 100) and (ch <= 147) then
+    Result := 9.0 + (ch - 100) * 0.25
+  else if (ch >= 149) and (ch <= 168) then
+    Result := 21.0 + (ch - 149) * 0.25
+  else
+    Result := -100.0;
+end;
+
+procedure BuildFake5GNets(out out_nets: TNetArray);
+  procedure Put(idx: integer; const ssid: string; ch, w_mhz, dbm: integer;
+    col: LongWord);
+  begin
+    out_nets[idx].ssid := ssid;
+    out_nets[idx].channel := ch;
+    out_nets[idx].width_mhz := w_mhz;
+    out_nets[idx].dbm := dbm;
+    out_nets[idx].color := col;
+  end;
+begin
+  { Sorted strongest-first (-34 dBm down to -72 dBm) across UNII-1 (36..48),
+    UNII-2A (52..64), UNII-2C (100..144), and UNII-3 (149..165), with
+    20 / 40 / 80 MHz channel widths }
+  SetLength(out_nets, 12);
+  Put(0,  'Mosaico-5G-Ultra', 42,  80, -34, PALETTE[0]);
+  Put(1,  'HomeTheater-5G',   155, 80, -38, PALETTE[4]);
+  Put(2,  'Office-Lab-36',    36,  20, -42, PALETTE[1]);
+  Put(3,  'ESP32-S31-5G',     54,  40, -46, PALETTE[2]);
+  Put(4,  'Studio-Mesh-100',  102, 40, -49, PALETTE[3]);
+  Put(5,  'CloudLab-DFS',     122, 80, -52, PALETTE[6]);
+  Put(6,  'DevNet-UNII2',     64,  20, -56, PALETTE[5]);
+  Put(7,  'Guest-5GHz-165',   165, 20, -59, PALETTE[7]);
+  Put(8,  'IoT-Backbone-48',  48,  20, -63, PALETTE_OTHER);
+  Put(9,  'Sensor-Link-136',  134, 40, -65, PALETTE_OTHER);
+  Put(10, 'Conference-108',   108, 20, -68, PALETTE_OTHER);
+  Put(11, 'Roof-Relay-149',   149, 20, -72, PALETTE_OTHER);
+end;
+
+procedure BuildFake5GHistLines(out lines: THistLines);
+const
+  NAMES: array[0..5] of string = (
+    'Mosaico-', 'HomeThea', 'Office-L', 'ESP32-S3', 'Studio-M', 'CloudLab'
+  );
+  BASE_DBM: array[0..5] of integer = (-34, -38, -42, -46, -49, -52);
+  COLORS: array[0..5] of LongWord = (
+    $3399FF, $CC4DE6, $FF664D, $4DE666, $FFCC33, $FF8000
+  );
+  RIPPLE: array[0..7] of integer = (0, 1, 2, 1, 0, -1, -2, -1);
+var
+  i, k, v: integer;
+begin
+  SetLength(lines, 6);
+  for i := 0 to 5 do
+  begin
+    lines[i].color := COLORS[i];
+    lines[i].name := NAMES[i];
+    SetLength(lines[i].pts, 60);
+    for k := 0 to 59 do
+    begin
+      v := BASE_DBM[i] + RIPPLE[(k + i * 3) and 7];
+      if ((k + i * 5) mod 17) = 0 then
+        Dec(v, 2);
+      lines[i].pts[k] := v;
+    end;
+  end;
 end;
 
 function DbmAxis(plot_h: integer): TAxisMap;
@@ -276,17 +389,35 @@ begin
   { occupancy bands under grid/curves — C util_band_color per permille.
     util_pm[i]: 0..1000, -1 = no data (stays black). Extend across the
     full width [0..p.W-1] so ch1's column renders behind the Y-axis labels. }
-  for i := 0 to 12 do
+  if not ChBand5G then
   begin
-    k := util_pm[i];
-    x0 := PlotRound(AxPix(ax, (i + 1) - 0.5));
-    x1 := PlotRound(AxPix(ax, (i + 1) + 0.5));
-    if x0 < 0 then
-      x0 := 0;
-    if x1 >= p.W then
-      x1 := p.W - 1;
-    if (x1 >= x0) and (k >= 0) then
-      PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
+    for i := 0 to 12 do
+    begin
+      k := util_pm[i];
+      x0 := PlotRound(AxPix(ax, (i + 1) - 0.5));
+      x1 := PlotRound(AxPix(ax, (i + 1) + 0.5));
+      if x0 < 0 then
+        x0 := 0;
+      if x1 >= p.W then
+        x1 := p.W - 1;
+      if (x1 >= x0) and (k >= 0) then
+        PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
+    end;
+  end
+  else
+  begin
+    for i := 1 to CH5G_COUNT do
+    begin
+      k := FAKE_5G_UTIL_PM[i];
+      x0 := PlotRound(AxPix(ax, i - 0.5));
+      x1 := PlotRound(AxPix(ax, i + 0.5));
+      if x0 < 0 then
+        x0 := 0;
+      if x1 >= p.W then
+        x1 := p.W - 1;
+      if (x1 >= x0) and (k >= 0) then
+        PlotFillRect(p, x0, CH_MT, x1 - x0 + 1, plot_h, wa_util_band_rgb(k), 255);
+    end;
   end;
 
   { horizontal dBm gridlines + labels (-80..-20 step 10) }
@@ -305,7 +436,7 @@ begin
   end;
 
   { vertical channel gridlines + tick labels across [0..p.W-1] }
-  if ChViewEnd <= 20 then
+  if not ChBand5G then
   begin
     for i := 1 to 14 do
     begin
@@ -319,18 +450,28 @@ begin
   end
   else
   begin
-    { 5 GHz channel ticks (36..165 step 8 so labels do not overlap) }
-    i := 36;
-    while i <= 165 do
+    { 25 Mosaico-supported 5 GHz columns: 1 column = 4 channels (same width
+      as 1 channel in 2.4 GHz), labeled 36, 40, 44, 48 .. 64, 100 .. 144, 149 .. 165 }
+    for i := 1 to CH5G_COUNT do
     begin
       tx := PlotRound(AxPix(ax, i));
       if (tx >= 0) and (tx < p.W) then
       begin
         PlotFillRect(p, tx, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
-        AddLabel(labels, tx - 8, p.H - CH_MB + 15, IntToStr(i), DIM_HEX);
+        k := CH5G_CHANNELS[i];
+        if k >= 100 then
+          AddLabel(labels, tx - 11, p.H - CH_MB + 15, IntToStr(k), DIM_HEX)
+        else
+          AddLabel(labels, tx - 7, p.H - CH_MB + 15, IntToStr(k), DIM_HEX);
       end;
-      Inc(i, 8);
     end;
+    { Sub-band skip markers between 64..100 (col 8.5) and 144..149 (col 20.5) }
+    dst.Color := HGRID_HEX;
+    dst.WidthPx := 1;
+    dst.OnLen := 4;
+    dst.OffLen := 4;
+    PlotRefLineV(p, 8.5, ax, CH_MT, p.H - CH_MB, dst);
+    PlotRefLineV(p, 20.5, ax, CH_MT, p.H - CH_MB, dst);
   end;
 
   if Length(nets) = 0 then
@@ -349,10 +490,23 @@ begin
     if nets[i].dbm < DBM_MIN then
       continue;
     color := nets[i].color;
-    center := nets[i].channel;
-    bw := nets[i].width_mhz div 10;
-    if bw < 1 then
-      bw := 1;
+    if not ChBand5G then
+    begin
+      center := nets[i].channel;
+      bw := nets[i].width_mhz div 10;
+      if bw < 1 then
+        bw := 1;
+    end
+    else
+    begin
+      center := Ch5GToColPos(nets[i].channel);
+      if center < 0 then
+        continue;
+      { 1 column in 5 GHz view = 4 channels (20 MHz), so bw in columns is width_mhz / 40 }
+      bw := Single(nets[i].width_mhz) * Single(0.025);
+      if bw < Single(0.5) then
+        bw := Single(0.5);
+    end;
     if (center + bw * 2 < ChViewStart - 1.0) or
        (center - bw * 2 > ChViewEnd + 1.0) then
       continue;
@@ -384,7 +538,15 @@ begin
       break;
     if nets[i].dbm < DBM_MIN then
       continue;
-    tx := PlotRound(AxPix(ax, nets[i].channel));
+    if not ChBand5G then
+      center := nets[i].channel
+    else
+    begin
+      center := Ch5GToColPos(nets[i].channel);
+      if center < 0 then
+        continue;
+    end;
+    tx := PlotRound(AxPix(ax, center));
     if (tx < 0) or (tx >= p.W) then
       continue;
     tx := tx + 2;
@@ -425,7 +587,7 @@ begin
   end;
 
   { focused-channel dashed highlight, lines 1088-1096 }
-  if (focused >= CH_MIN) and (focused <= CH_MAX) then
+  if (not ChBand5G) and (focused >= CH_MIN) and (focused <= CH_MAX) then
   begin
     dst.Color := FOCUS_HEX;
     dst.WidthPx := 3;
@@ -448,7 +610,7 @@ var
   fst: TFillStyle;
   sst: TStrokeStyle;
 begin
-  if (ch < CH_MIN) or (ch > CH_MAX) then
+  if ChBand5G or (ch < CH_MIN) or (ch > CH_MAX) then
     exit;
 
   plot_w := p.W - CH_ML - CH_MR;

@@ -80,7 +80,7 @@ function PlotRound(v: Single): integer; inline;
 implementation
 
 procedure PlotBlendPixel(const p: TPlot; x, y: integer;
-  rgb: LongWord; alpha: Byte); inline;
+  rgb: LongWord; alpha: Byte);
 var
   q: PCardinal;
   dst, r0, g0, b0, a256, inv_a: LongWord;
@@ -231,7 +231,7 @@ end;
 procedure PlotDashedVLine(const p: TPlot; x, y0, y1, w: integer;
   rgb: LongWord; onLen, offLen: integer);
 var
-  y, yy, half, i: integer;
+  y, seg, half: integer;
   on: boolean;
 begin
   if w < 1 then
@@ -242,12 +242,13 @@ begin
   while y <= y1 do
   begin
     if on then
-      { the whole "on" run, not a single row }
-      for yy := y to y + onLen - 1 do
-        for i := x - half to x - half + w - 1 do
-          PlotBlendPixel(p, i, yy, rgb, 255);
-    if on then
-      Inc(y, onLen)
+    begin
+      seg := onLen;
+      if y + seg - 1 > y1 then
+        seg := y1 - y + 1;
+      PlotFillRect(p, x - half, y, w, seg, rgb, 255);
+      Inc(y, onLen);
+    end
     else
       Inc(y, offLen);
     on := not on;

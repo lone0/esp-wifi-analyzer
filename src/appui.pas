@@ -51,10 +51,10 @@ const
   { montserrat_14: label top = cairo baseline - (16 - 3) }
   LABEL_BASELINE_OFFSET = 13;
 
-  { label pool: channel view 9 dBm + 13 ch + 8 SSID = 30, history 5 }
-  N_LABELS = 40;
+  { label pool: channel view 7 dBm + 25 ch + 10 SSID = 42, history 13 }
+  N_LABELS = 48;
 
-  { view registry - add entries here as views grow }
+  { view registry: 0 = CH, 1 = HIST }
   VIEW_COUNT = 2;
   VIEW_NAMES: array[0..VIEW_COUNT - 1] of PChar = ('CH', 'HIST');
 
@@ -126,7 +126,8 @@ var
   last_scan_busy: shortint = -1;
   last_bat_poll_us: int64 = 0;
   snap: TAPEntries;
-  nets: array of TNet;
+  nets: TNetArray;
+  fake_5g_nets: TNetArray;
 
 function Plot: TPlot; inline;
 begin
@@ -226,18 +227,53 @@ var
   labels: TChartLabels;
   hlines: THistLines;
   util: TUtil13;
-  ch: integer;
+  ch, n_drawn: integer;
   t0, t1, t2: int64;
+  status_buf: string;
 begin
   wa_ui_bus_acquire;
   t0 := esp_timer_get_time;
   for ch := 0 to 12 do
     util[ch] := scanner.ChannelUtilPM(ch + 1);
+  n_drawn := Length(nets);
   case active_view of
-    0: DrawChannelView(Plot, nets, 0, util, labels);
+    0:
+    begin
+      if chartsmodel.ChBand5G then
+      begin
+        if Length(fake_5g_nets) = 0 then
+          BuildFake5GNets(fake_5g_nets);
+        n_drawn := Length(fake_5g_nets);
+        DrawChannelView(Plot, fake_5g_nets, 0, util, labels);
+        if last_ap_count <> n_drawn then
+        begin
+          last_ap_count := n_drawn;
+          status_buf := 'AP: ' + IntToStr(n_drawn);
+          lv_label_set_text(ap_label, PChar(status_buf));
+        end;
+      end
+      else
+      begin
+        DrawChannelView(Plot, nets, 0, util, labels);
+      end;
+    end;
     1:
     begin
-      BuildHistLines(hlines);
+      if chartsmodel.ChBand5G then
+      begin
+        if Length(fake_5g_nets) = 0 then
+          BuildFake5GNets(fake_5g_nets);
+        n_drawn := Length(fake_5g_nets);
+        BuildFake5GHistLines(hlines);
+        if last_ap_count <> n_drawn then
+        begin
+          last_ap_count := n_drawn;
+          status_buf := 'AP: ' + IntToStr(n_drawn);
+          lv_label_set_text(ap_label, PChar(status_buf));
+        end;
+      end
+      else
+        BuildHistLines(hlines);
       DrawHistoryView(Plot, hlines, labels);
     end;
   end;
@@ -245,8 +281,8 @@ begin
   SyncLabels(labels);
   lv_obj_invalidate(canvas_obj);
   t2 := esp_timer_get_time;
-  writeln('PROF-O2: FullRepaint view=', active_view, ' nets=', Length(nets),
-    ' | chartdraw=', t1 - t0, ' us | sync_labels=', t2 - t1, ' us');
+  writeln('PROF-O2: FullRepaint view=', active_view, ' 5g=', Ord(chartsmodel.ChBand5G),
+    ' nets=', n_drawn, ' | chartdraw=', t1 - t0, ' us | sync_labels=', t2 - t1, ' us');
 end;
 
 procedure InvalidateChannelStrip(ch: integer);
@@ -307,7 +343,8 @@ begin
   if scanner.WalkActive <> 0 then
     exit;
 
-  if longint(count) <> last_ap_count then
+  if (not chartsmodel.ChBand5G) and
+     (longint(count) <> last_ap_count) then
   begin
     last_ap_count := longint(count);
     status_buf := 'AP: ' + IntToStr(count);
@@ -339,7 +376,8 @@ begin
     drawn_util_rev := util_rev;
     repaint_pending := 0;
     RefreshSnapshot;
-    RepaintActive;
+    if not chartsmodel.ChBand5G then
+      RepaintActive;
     scanner.UtilNeedFullPaint := 0;
     exit;
   end;
@@ -348,7 +386,7 @@ begin
   if (scanner.UtilDeferPaint <> 0) and (scanner.UtilPatchCh <> 0) then
   begin
     pch := scanner.UtilPatchCh;
-    if active_view = 0 then
+    if (active_view = 0) and (not chartsmodel.ChBand5G) then
     begin
       if Length(nets) = 0 then
         RefreshSnapshot;
@@ -372,12 +410,14 @@ begin
     drawn_revision := rev;
     drawn_util_rev := util_rev;
     RefreshSnapshot;
-    RepaintActive;
+    if not chartsmodel.ChBand5G then
+      RepaintActive;
   end;
 end;
 
 procedure SwitchView(v: integer); forward;
 procedure PerformViewSwitch(v: integer); forward;
+procedure ApplySpanPreset(mode: integer); forward;
 
 procedure ViewBtnCb(e: plv_event_t); cdecl;
 var
@@ -458,15 +498,19 @@ end;
 
 procedure ApplySpanPreset(mode: integer);
 begin
+  wa_ui_bus_acquire;
   StyleQuickSpanBtns(mode);
   case mode of
-    0: SetChViewport(1.0, 13.0, -1.0, 15.0);
-    1: SetChViewport(1.0, 7.0, 0.5, 13.5);
-    2: SetChViewport(36.0, 68.0, 32.0, 169.0);
+    0: SetChBand5G(false);
+    1:
+    begin
+      SetChBand5G(false);
+      SetChViewport(1.0, 7.0, 0.5, 13.5);
+    end;
+    2: SetChBand5G(true);
   end;
   last_drawn_v0 := ChViewStart;
-  if active_view <> 0 then
-    SwitchView(0);
+  SwitchView(0);
   if Length(nets) = 0 then
     RefreshSnapshot;
   RepaintActive;
@@ -724,9 +768,9 @@ begin
   if not wa_touch_indicator_start(TBoardLvgl.Touch) then
     writeln('WA: W touch indicator unavailable');
   wa_gesture_attach(canvas_obj, @OnCanvasGesture);
-  SwitchView(0);
+  BuildFake5GNets(fake_5g_nets);
   RefreshSnapshot;
-  RepaintActive;
+  ApplySpanPreset(0);
   lv_timer_create(@TickCb, 15, nil);
 end;
 
