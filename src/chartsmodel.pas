@@ -166,6 +166,27 @@ implementation
 function wa_util_band_rgb(permille: LongInt): LongWord; cdecl; external;
 function expf(x: Single): Single; cdecl; external;
 
+var
+  gauss_amp: array[0..60] of Single;
+  gauss_norm: array[0..60] of Single;
+  gauss_ready: boolean = false;
+
+procedure EnsureGaussLut;
+var
+  k: integer;
+  u: Single;
+begin
+  if gauss_ready then
+    exit;
+  for k := 0 to 60 do
+  begin
+    u := -2.0 + (4.0 * k) / 60.0;
+    gauss_norm[k] := u;
+    gauss_amp[k] := expf(-u * u * 2.0);
+  end;
+  gauss_ready := true;
+end;
+
 function ChAxis(plot_w: integer): TAxisMap;
 begin
   Result.Pix0 := CH_ML;
@@ -319,6 +340,8 @@ begin
   end;
 
   { bell curves, weakest first; 61 gaussian samples in value space }
+  EnsureGaussLut;
+  SetLength(s, 61);
   for i := High(nets) downto 0 do
   begin
     if i >= MAX_CURVES then
@@ -327,16 +350,18 @@ begin
       continue;
     color := nets[i].color;
     center := nets[i].channel;
-    bw := nets[i].width_mhz / 10;
+    bw := nets[i].width_mhz div 10;
     if bw < 1 then
       bw := 1;
+    if (center + bw * 2 < ChViewStart - 1.0) or
+       (center - bw * 2 > ChViewEnd + 1.0) then
+      continue;
 
-    SetLength(s, 61);
+    amp := nets[i].dbm - DBM_MIN;
     for k := 0 to 60 do
     begin
-      s[k].X := center - bw * 2 + bw * 4 * k / 60;
-      amp := expf(-sqr((s[k].X - center) / bw) * 2);
-      s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
+      s[k].X := center + bw * gauss_norm[k];
+      s[k].Y := DBM_MIN + amp * gauss_amp[k];
     end;
     fst.Color := color;
     fst.Alpha := FILL_A;
@@ -462,6 +487,8 @@ begin
     PlotFillRect(p, gy, CH_MT, 1, plot_h + 1, gst.Color, gst.Alpha);
 
   { restore bell pixels that fall in this strip }
+  EnsureGaussLut;
+  SetLength(s, 61);
   for i := High(nets) downto 0 do
   begin
     if i >= MAX_CURVES then
@@ -470,15 +497,16 @@ begin
       continue;
     color := nets[i].color;
     center := nets[i].channel;
-    bw := nets[i].width_mhz / 10;
+    bw := nets[i].width_mhz div 10;
     if bw < 1 then
       bw := 1;
-    SetLength(s, 61);
+    if (center + bw * 2 < ch - 0.6) or (center - bw * 2 > ch + 0.6) then
+      continue;
+    amp := nets[i].dbm - DBM_MIN;
     for k := 0 to 60 do
     begin
-      s[k].X := center - bw * 2 + bw * 4 * k / 60;
-      amp := expf(-sqr((s[k].X - center) / bw) * 2);
-      s[k].Y := DBM_MIN + (nets[i].dbm - DBM_MIN) * amp;
+      s[k].X := center + bw * gauss_norm[k];
+      s[k].Y := DBM_MIN + amp * gauss_amp[k];
     end;
     fst.Color := color;
     fst.Alpha := FILL_A;

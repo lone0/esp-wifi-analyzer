@@ -58,6 +58,13 @@ void wa_console_flush_start(void)
     }
 }
 
+int32_t wa_round_s(float v)
+{
+    int32_t res;
+    __asm__ volatile ("fcvt.w.s %0, %1, rmm" : "=r"(res) : "f"(v));
+    return res;
+}
+
 const wifi_init_config_t *wifi_default_init_config(void)
 {
     static wifi_init_config_t cfg;

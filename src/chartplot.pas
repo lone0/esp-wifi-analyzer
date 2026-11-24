@@ -181,33 +181,47 @@ procedure PlotSeriesFillBaselineClip(const p: TPlot; const s: TSeries;
   const fill: TFillStyle; const stroke: TStrokeStyle;
   clipX0, clipX1: integer);
 var
-  i, xi, x0, x1, ry, base_i: integer;
-  frac: Single;
+  i, n, xi, x0, x1, ry, base_i, dx, dy, px0, py0, px1, py1: integer;
 begin
-  if Length(s) < 2 then
+  n := Length(s);
+  if n < 2 then
     exit;
+  base_i := PlotRound(AxPix(ay, baselineVal));
   x0 := PlotRound(AxPix(ax, s[0].X));
-  x1 := PlotRound(AxPix(ax, s[High(s)].X));
+  x1 := PlotRound(AxPix(ax, s[n - 1].X));
   if x0 < clipX0 then
     x0 := clipX0;
   if x1 > clipX1 then
     x1 := clipX1;
   if x0 > x1 then
     exit;
-  base_i := PlotRound(AxPix(ay, baselineVal));
+
+  i := 0;
+  px0 := PlotRound(AxPix(ax, s[0].X));
+  py0 := PlotRound(AxPix(ay, s[0].Y));
+  px1 := PlotRound(AxPix(ax, s[1].X));
+  py1 := PlotRound(AxPix(ay, s[1].Y));
 
   for xi := x0 to x1 do
   begin
-    i := 0;
-    while (i < High(s) - 1) and (AxPix(ax, s[i + 1].X) < xi) do
+    while (i < n - 2) and (px1 < xi) do
+    begin
       Inc(i);
-    if AxPix(ax, s[i + 1].X) = AxPix(ax, s[i].X) then
-      frac := 0
+      px0 := px1;
+      py0 := py1;
+      px1 := PlotRound(AxPix(ax, s[i + 1].X));
+      py1 := PlotRound(AxPix(ay, s[i + 1].Y));
+    end;
+    dx := px1 - px0;
+    dy := py1 - py0;
+    if dx <= 0 then
+      ry := py0
+    else if xi <= px0 then
+      ry := py0
+    else if xi >= px1 then
+      ry := py1
     else
-      frac := (xi - AxPix(ax, s[i].X)) / (AxPix(ax, s[i + 1].X) - AxPix(ax, s[i].X));
-    if frac > 1 then
-      frac := 1;
-    ry := PlotRound(AxPix(ay, s[i].Y) + frac * (AxPix(ay, s[i + 1].Y) - AxPix(ay, s[i].Y)));
+      ry := py0 + ((xi - px0) * dy) div dx;
     PlotFillRect(p, xi, ry, 1, base_i - ry + 1, fill.Color, fill.Alpha);
     PlotStrokeColumn(p, xi, ry, stroke.Color, stroke.Alpha);
   end;

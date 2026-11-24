@@ -556,10 +556,10 @@ begin
         span := drag_start_v1 - drag_start_v0;
         dval := -dx * span / plot_w;
         SetChViewport(drag_start_v0 + dval, drag_start_v1 + dval, ChScrollMin, ChScrollMax);
-        if Abs(ChViewStart - last_drawn_v0) >= 0.15 then
+        if Abs(ChViewStart - last_drawn_v0) >= 0.08 then
         begin
           last_drawn_v0 := ChViewStart;
-          RepaintActive;
+          repaint_pending := 1;
         end;
       end;
     end;

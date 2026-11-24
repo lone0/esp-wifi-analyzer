@@ -80,49 +80,106 @@ function PlotRound(v: Single): integer; inline;
 implementation
 
 procedure PlotBlendPixel(const p: TPlot; x, y: integer;
-  rgb: LongWord; alpha: Byte);
+  rgb: LongWord; alpha: Byte); inline;
 var
   q: PCardinal;
-  dst, r0, g0, b0: LongWord;
-  dr, dg, db: Integer;
+  dst, r0, g0, b0, a256, inv_a: LongWord;
 begin
-  if (x < 0) or (x >= p.W) or (y < 0) or (y >= p.H) then
+  if (x < 0) or (x >= p.W) or (y < 0) or (y >= p.H) or (alpha = 0) then
     exit;
-  q := p.Buf;
-  Inc(q, y * p.W + x);
-  if alpha = 0 then
-    exit;
-  dst := q^;
+  q := p.Buf + (y * p.W + x);
   if alpha = 255 then
   begin
     q^ := $FF000000 or (rgb and $FFFFFF);
     exit;
   end;
-  { per-channel: dst + (src - dst) * alpha / 255. The difference is
-    signed - blending down (src < dst) must subtract, not wrap. The
-    truncating div is the same 8-bit channel math as a cairo ARGB32
-    blend, <=1 LSB off. }
-  dr := Integer((rgb shr 16) and $FF) - Integer((dst shr 16) and $FF);
-  dg := Integer((rgb shr 8) and $FF) - Integer((dst shr 8) and $FF);
-  db := Integer(rgb and $FF) - Integer(dst and $FF);
-  r0 := ((dst shr 16) and $FF) + LongWord((dr * alpha) div 255);
-  g0 := ((dst shr 8) and $FF) + LongWord((dg * alpha) div 255);
-  b0 := (dst and $FF) + LongWord((db * alpha) div 255);
+  dst := q^;
+  a256 := alpha + (alpha shr 7);
+  inv_a := 256 - a256;
+  r0 := (((rgb shr 16) and $FF) * a256 + ((dst shr 16) and $FF) * inv_a) shr 8;
+  g0 := (((rgb shr 8) and $FF) * a256 + ((dst shr 8) and $FF) * inv_a) shr 8;
+  b0 := ((rgb and $FF) * a256 + (dst and $FF) * inv_a) shr 8;
   q^ := $FF000000 or (r0 shl 16) or (g0 shl 8) or b0;
 end;
 
 procedure PlotFillRect(const p: TPlot; x, y, w, h: integer;
   rgb: LongWord; alpha: Byte);
 var
-  i, j, xe, ye: integer;
+  x0, y0, x1, y1, span_w, i, j, stride: integer;
+  q: PCardinal;
+  val, dst, sr, sg, sb, r0, g0, b0, a256, inv_a: LongWord;
 begin
-  if (w <= 0) or (h <= 0) then
+  if (w <= 0) or (h <= 0) or (alpha = 0) then
     exit;
-  xe := x + w - 1;
-  ye := y + h - 1;
-  for j := y to ye do
-    for i := x to xe do
-      PlotBlendPixel(p, i, j, rgb, alpha);
+  x0 := x;
+  y0 := y;
+  x1 := x + w - 1;
+  y1 := y + h - 1;
+  if x0 < 0 then
+    x0 := 0;
+  if y0 < 0 then
+    y0 := 0;
+  if x1 >= p.W then
+    x1 := p.W - 1;
+  if y1 >= p.H then
+    y1 := p.H - 1;
+  if (x0 > x1) or (y0 > y1) then
+    exit;
+
+  span_w := x1 - x0 + 1;
+  stride := p.W;
+
+  if alpha = 255 then
+  begin
+    val := $FF000000 or (rgb and $FFFFFF);
+    if (x0 = 0) and (span_w = stride) then
+    begin
+      FillDWord((p.Buf + y0 * stride)^, (y1 - y0 + 1) * stride, val);
+      exit;
+    end;
+    q := p.Buf + (y0 * stride + x0);
+    for j := y0 to y1 do
+    begin
+      FillDWord(q^, span_w, val);
+      Inc(q, stride);
+    end;
+    exit;
+  end;
+
+  a256 := alpha + (alpha shr 7);
+  inv_a := 256 - a256;
+  sr := ((rgb shr 16) and $FF) * a256;
+  sg := ((rgb shr 8) and $FF) * a256;
+  sb := (rgb and $FF) * a256;
+
+  if span_w = 1 then
+  begin
+    q := p.Buf + (y0 * stride + x0);
+    for j := y0 to y1 do
+    begin
+      dst := q^;
+      r0 := (sr + ((dst shr 16) and $FF) * inv_a) shr 8;
+      g0 := (sg + ((dst shr 8) and $FF) * inv_a) shr 8;
+      b0 := (sb + (dst and $FF) * inv_a) shr 8;
+      q^ := $FF000000 or (r0 shl 16) or (g0 shl 8) or b0;
+      Inc(q, stride);
+    end;
+    exit;
+  end;
+
+  for j := y0 to y1 do
+  begin
+    q := p.Buf + (j * stride + x0);
+    for i := 0 to span_w - 1 do
+    begin
+      dst := q^;
+      r0 := (sr + ((dst shr 16) and $FF) * inv_a) shr 8;
+      g0 := (sg + ((dst shr 8) and $FF) * inv_a) shr 8;
+      b0 := (sb + (dst and $FF) * inv_a) shr 8;
+      q^ := $FF000000 or (r0 shl 16) or (g0 shl 8) or b0;
+      Inc(q);
+    end;
+  end;
 end;
 
 procedure PlotStrokeColumn(const p: TPlot; x, y: integer;
@@ -197,12 +254,11 @@ begin
   end;
 end;
 
+function wa_round_s(v: Single): LongInt; cdecl; external;
+
 function PlotRound(v: Single): integer; inline;
 begin
-  if v >= 0 then
-    Result := Trunc(v + 0.5)
-  else
-    Result := Trunc(v - 0.5);
+  Result := wa_round_s(v);
 end;
 
 end.
