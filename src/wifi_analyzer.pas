@@ -12,11 +12,11 @@ program wifi_analyzer;
                     boardlvgl) over the chartdraw raster canvas; 250 ms
                     revision-gated tick, no paint near the 100 ms budget
 
-  The display chain is boardlvgl.Start: BMGR display_lcd through the
-  boarddisplay override path (psram_dma_direct + 80 MHz) + adapter +
-  touch, one call. Everything LVGL afterwards runs under UILock/UIUnlock
-  (the adapter lock is recursive, so the LVGL task's own timer/event
-  callbacks may take it too).
+  The display chain is boardlvgl.Start: BMGR display_lcd (yaml-as-is via
+  boarddisplay; psram_dma_direct + 80 MHz live in board_devices.yaml /
+  gen_bmgr_codes) + adapter + touch, one call. Everything LVGL afterwards
+  runs under UILock/UIUnlock (the adapter lock is recursive, so the LVGL
+  task's own timer/event callbacks may take it too).
 
   esp-units.pas is used frozen (submodule): the app-side L1 growth
   (esp_wifi scan offsets from compiled probes, lv_timer/event-user-data/
@@ -32,7 +32,6 @@ program wifi_analyzer;
 uses
   idfheap,          { MUST be first: installs the IDF heap manager }
   fthreads,         { Pascal TLS for scanner and LVGL callbacks }
-  mosaicobmgrdeps,  { app-specific generated Mosaico table closure }
   c_bmgr,           { esp_err_t + BMGR core (esp-units submodule) }
   boardlvgl,        { L2 facade: one Start lights the panel chain }
   SysUtils,         { HexStr }

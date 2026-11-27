@@ -25,17 +25,13 @@ idf_component_register(SRCS "app_main.c"
 #   ESP_TOOLCHAIN_BIN    riscv32 binutils (esp-env-esp32s31 sets it)
 # Run:  idf.py --preview pas        (after idf.py build)
 #
-# Ordinary C dependencies are owned by their L1 Pascal units via {$linklib}.
-# The generated BMGR runtime/factory objects and the active subtype registration
-# objects are linked explicitly: whole-archive is too broad for this image, but
-# plain archive resolution otherwise selects the component's weak fallbacks.
+# Ordinary C dependencies are owned by their L1 Pascal units via {$linklib};
+# board/transport archives are passed via --lib and resolved inside link.res's
+# GROUP(...) without --whole-archive.
 idf_build_get_property(python PYTHON)
 
 add_custom_target(pas
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/pasobjs
-  COMMAND bash -c "cd ${CMAKE_BINARY_DIR}/pasobjs && ar x ${CMAKE_BINARY_DIR}/esp-idf/gen_bmgr_codes/libgen_bmgr_codes.a board_runtime.c.obj setup_device.c.obj"
-  COMMAND bash -c "cd ${CMAKE_BINARY_DIR}/pasobjs && ar x ${CMAKE_BINARY_DIR}/esp-idf/espressif__esp_board_manager/libespressif__esp_board_manager.a dev_button_sub_gpio.c.obj dev_camera_sub_dvp.c.obj dev_display_lcd_sub_spi.c.obj dev_lcd_touch_sub_i2c.c.obj dev_power_ctrl_sub_custom.c.obj dev_power_ctrl_sub_gpio.c.obj"
-  COMMAND bash -c "cd ${CMAKE_SOURCE_DIR} && ESP32_SDK_PROJECT=${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/esp-units.pas/scripts/build.sh src/wifi_analyzer.pas --soc esp32s31 -O2 --c src/wifi_cfg_shim.c --obj ${CMAKE_BINARY_DIR}/pasobjs/board_runtime.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/setup_device.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_button_sub_gpio.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_camera_sub_dvp.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_display_lcd_sub_spi.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_lcd_touch_sub_i2c.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_power_ctrl_sub_custom.c.obj --obj ${CMAKE_BINARY_DIR}/pasobjs/dev_power_ctrl_sub_gpio.c.obj"
+  COMMAND bash -c "cd ${CMAKE_SOURCE_DIR} && ESP32_SDK_PROJECT=${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/esp-units.pas/scripts/build.sh src/wifi_analyzer.pas --soc esp32s31 -O2 --c src/wifi_cfg_shim.c --lib espressif__bq27220 --lib espressif__button --lib espressif__esp_video --lib espressif__esp_cam_sensor --lib espressif__esp_codec_dev --lib esp_driver_i2s --lib esp_driver_cam --lib esp_hal_i2s --lib esp_hal_cam --lib espressif__esp_sccb_intf --lib espressif__esp_lcd_touch_cst9220 --lib espressif__esp_lcd_co5300 --lib esp_lcd --lib esp_driver_i2c --lib esp_hal_i2c --lib esp_driver_spi --lib espressif__esp_lcd_touch --lib espressif__i2c_bus --lib esp_driver_ledc --lib esp_hal_ledc --lib esp_pm"
   COMMAND ${python} "$ENV{IDF_PATH}/components/partition_table/check_sizes.py"
           --offset ${CONFIG_PARTITION_TABLE_OFFSET} partition --type app --subtype factory
           ${CMAKE_BINARY_DIR}/partition_table/partition-table.bin
